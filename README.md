@@ -5,6 +5,7 @@ Intended to show the benefits of atomic multi-path payments on the Lightning Net
 #### Essential
 - Create basic network/graph of nodes, with edges representing payment channels of equity and allow for (attempt at least) transfer of regular payments between nodes.
 - Impose fees for hops (base + percentage) on nodes based on some intuitive fee distribution.
+- Implement (or simulate) HTLCs (hash time-locked contracts) for money to be retrieved on failed payments.
 - Fix routing: should be based on fees + time-locks (if time-locks implemented), and maybe a margin on equity if available, not lowest equity path!
   - Should also find path in manner different to reducing to sub-graph based on equity.
 - Define topology creating functions for small-world & scale-free.
