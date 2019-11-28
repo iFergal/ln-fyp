@@ -20,10 +20,12 @@ class Node:
     def get_fees(self):
         return self._fee_rate
 
-    def update_chan(self, G, dest, amnt):
+    def update_chan(self, G, dest, amnt, p_type="reg"):
         """Update a channel's balance by making a payment from src to dest.
 
         We assume both parties sign the update automatically for simulation purposes.
+        p_type: "reg" if normal, "htlc" if funds locked until released, "rev-htlc" if claim back
+
         Return True if successful, False otherwise.
         """
         if G.has_edge(self, dest):
@@ -32,10 +34,14 @@ class Node:
             else:
                 side, other_side = "equity_b", "equity_a"
 
-            # Assume: amnt > 0
-            if G[self][dest][side][1] >= amnt:
+            # Assume: amnt > 0, check for available funds only
+            if G[self][dest][side][2] >= amnt:
                 G[self][dest][side][1] -= amnt
+                if p_type != "rev-htlc": G[self][dest][side][2] -= amnt
+
                 G[self][dest][other_side][1] += amnt
+                if p_type != "htlc": G[self][dest][other_side][2] += amnt  # Only available if not locked
+
                 return True
             else:
                 print("Error: equity between %s and %s not available for transfer." % (self, dest))
@@ -57,20 +63,35 @@ class Node:
             path = nx.shortest_path(searchable, self, dest, weight="equity")
             send_amnts = self._calc_with_path_fees(path, amnt)
 
-            if len(path) > 20:
+            if len(path) > 20:  # LN standard
                 print("Error: path exceeds max-hop distance.")
                 return False
 
             for i in range(len(path)-1):
-                hop = path[i].update_chan(G, path[i+1], send_amnts[i])
+                hop = path[i].update_chan(G, path[i+1], send_amnts[i], "htlc")
                 if hop:
                     print("Sent %f from %s to %s." % (send_amnts[i], path[i], path[i+1]))
                 else:
                     print("Payment failed.")
+
+                    # Need to reverse the HTLCs
+                    for j in range(i):   # j=0, i=1
+                        hop = path[i-j].update_chan(G, path[i-j-1], send_amnts[i-j-1], "rev-htlc")
+                        print("Sent %f from %s to %s." % (send_amnts[i-j-1], path[i-j], path[i-j-1]))
+
                     return False
         else:
             print("No route available.")
             return False
+
+        # Successful so need to release all HTLCs, so run through path again
+        for i in range(len(path)-1):
+            edge = G[path[i]][path[i+1]]
+            side = "equity_a" if edge["equity_a"][0] == path[i+1] else "equity_b"  # Determine side
+
+            edge[side][2] += send_amnts[i]
+            print("Released %f for %s." % (send_amnts[i], path[i+1]))
+
         return True
 
     def _calc_with_path_fees(self, path, amnt):
@@ -106,7 +127,8 @@ def generate_wattz_strogatz(n, k, p, seed=None):
         targets = nodes[j:] + nodes[0:j]  # first j nodes are now last in list
         pairs = list(zip(nodes, targets))
         for pair in pairs:
-            G.add_edge(pair[0], pair[1], equity=30, equity_a=[pair[0], 10], equity_b=[pair[1], 20])
+            # equity_{a | b} = [node, equity, available_equity], where available means not locked in HTLC
+            G.add_edge(pair[0], pair[1], equity=30, equity_a=[pair[0], 10, 10], equity_b=[pair[1], 20, 20])
 
     # rewire edges from each node
     # loop over all nodes in order (label) and neighbours in order (distance)
@@ -124,7 +146,7 @@ def generate_wattz_strogatz(n, k, p, seed=None):
                         break  # skip this rewiring
                 else:
                     G.remove_edge(u, v)
-                    G.add_edge(u, w, equity=30, equity_a=[u, 10], equity_b=[v, 20])
+                    G.add_edge(u, w, equity=30, equity_a=[u, 10, 10], equity_b=[v, 20, 20])
     return G
 
 if __name__ == "__main__":
