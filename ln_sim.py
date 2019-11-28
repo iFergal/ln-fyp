@@ -15,10 +15,13 @@ class Node:
         We assume both parties sign the update automatically for simulation purposes.
         Return True if successful, False otherwise.
         """
-        if G.has_edge(self, dest):  # then (dest, self) must also exist
-            if (amnt > 0 and G[self][dest]["equity"] >= amnt) or (amnt < 0 and G[dest][self]["equity"] >= amnt):
-                G[self][dest]["equity"] += amnt
-                G[dest][self]["equity"] -= amnt
+        if G.has_edge(self, dest):
+            side = "equity_a" if G[self][dest]["equity_a"][0] == self else "equity_b"  # Determine direction
+
+            # Assume: amnt > 0
+            if G[self][dest][side][1] >= amnt:
+                G[self][dest][side][1] -= amnt
+                G[self][dest][side][1] += amnt
                 return True
             else:
                 print("Error: equity between %s and %s not available for transfer." % (self, dest))
@@ -33,7 +36,8 @@ class Node:
         """
 
         # Reduce graph to edges with enough equity - this is very costly - fix.
-        searchable = nx.DiGraph(((source, target, attr) for source, target, attr in G.edges(data=True) if attr["equity"] > amnt))
+        searchable = nx.Graph(((source, target, attr) for source, target, attr in G.edges(data=True) \
+                                if attr["equity"] > amnt))
 
         if self in searchable and dest in searchable and nx.has_path(searchable, self, dest):
             path = nx.shortest_path(searchable, self, dest, weight="equity")
@@ -67,7 +71,7 @@ def generate_wattz_strogatz(n, k, p, seed=None):
     if k == n:
         return nx.complete_graph(n)
 
-    G = nx.DiGraph()
+    G = nx.Graph()
     nodes = [Node(i, 500) for i in range(n)]
 
     # connect each node to k/2 neighbours
@@ -75,8 +79,7 @@ def generate_wattz_strogatz(n, k, p, seed=None):
         targets = nodes[j:] + nodes[0:j]  # first j nodes are now last in list
         pairs = list(zip(nodes, targets))
         for pair in pairs:
-            G.add_edge(pair[0], pair[1], equity=10)
-            G.add_edge(pair[1], pair[0], equity=20)
+            G.add_edge(pair[0], pair[1], equity=30, equity_a=[pair[0], 10], equity_b=[pair[1], 20])
 
     # rewire edges from each node
     # loop over all nodes in order (label) and neighbours in order (distance)
@@ -94,10 +97,7 @@ def generate_wattz_strogatz(n, k, p, seed=None):
                         break  # skip this rewiring
                 else:
                     G.remove_edge(u, v)
-                    G.remove_edge(v, u)
-
-                    G.add_edge(u, w, equity=10)
-                    G.add_edge(w, u, equity=20)
+                    G.add_edge(u, w, equity=30, equity_a=[u, 10], equity_b=[v, 20])
     return G
 
 if __name__ == "__main__":
