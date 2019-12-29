@@ -1,7 +1,8 @@
 import networkx as nx
 from networkx.algorithms.shortest_paths.weighted import dijkstra_path as dijkstra_path
+from networkx.generators.random_graphs import _random_subset
 import matplotlib.pyplot as plt
-from math import inf
+from math import inf, floor
 
 """
 Units of transfer are presumed to be satoshi (0.00000001 BTC) - this is the smallest unit
@@ -10,6 +11,16 @@ available on BTC - in reality, the LN supports millisatoshi for fee rounding pur
 
 N.B :- possible change here; LN-Daemon uses millisatoshi as base unit.
 
+"""
+
+"""
+Configuration
+"""
+
+NUM_NODES = 100
+
+"""
+Implementation
 """
 
 class Node:
@@ -47,10 +58,11 @@ class Node:
         searchable = nx.DiGraph(((src, tar, attr) for src, tar, attr in G.edges(data=True) \
                                 if G[src][tar]["equity"] + G[tar][src]["equity"] > amnt))
 
+        # Finds shortest path based on lowest fees, for now.
         if self in searchable and dest in searchable and nx.has_path(searchable, self, dest):
             path = dijkstra_path(searchable, self, dest, \
                     weight=lambda u, v, d: d["fees"][0] + d["fees"][1] * amnt)
-            send_amnts = self._calc_with_path_fees(G, path, amnt)
+            send_amnts = calc_path_fees(G, path, amnt)
 
             if len(path) - 1 > 20:  # LN standard
                 print("Error: path exceeds max-hop distance.")
@@ -83,22 +95,22 @@ class Node:
 
         return True
 
-    def _calc_with_path_fees(self, G, path, amnt):
-        """ Calculate the compound path fees required for a given path.
-
-        Note: compounding as amnt of equity moving per node is different!
-        """
-        hop_amnts = [amnt]
-        path = path[1:][::-1]  # No fees on first hop, reversed
-        for i in range(len(path)-1):
-            fees = G[path[i]][path[i+1]]["fees"]
-            fee_this_hop = fees[0] + fees[1] * hop_amnts[-1]
-            hop_amnts.append(fee_this_hop + hop_amnts[-1])
-        return hop_amnts[::-1]
-
-
     def __str__(self):
         return "Node %d" % self._id
+
+
+def calc_path_fees(G, path, amnt):
+    """ Calculate the compound path fees required for a given path.
+
+    Note: compounding as amnt of equity moving per node is different!
+    """
+    hop_amnts = [amnt]
+    path = path[1:][::-1]  # No fees on first hop, reversed
+    for i in range(len(path)-1):
+        fees = G[path[i]][path[i+1]]["fees"]
+        fee_this_hop = fees[0] + fees[1] * hop_amnts[-1]
+        hop_amnts.append(fee_this_hop + hop_amnts[-1])
+    return hop_amnts[::-1]
 
 # def find_path(G, src, dst, amnt):
 #     HOP_LIMIT = 20  # LN standard
@@ -107,7 +119,10 @@ class Node:
 
 @nx.utils.decorators.py_random_state(3)
 def generate_wattz_strogatz(n, k, p, seed=None):
-    """ As taken from NetworkX random_graph src code and modified. """
+    """ As taken from NetworkX random_graph src code and modified.
+
+    > SMALL WORLD graph.
+    """
     if k > n:
         raise nx.NetworkXError("k>n, choose smaller k or larger n")
 
@@ -148,11 +163,54 @@ def generate_wattz_strogatz(n, k, p, seed=None):
                     G.add_edge(w, u, equity=10, fees=[1, 0.05])
     return G
 
-if __name__ == "__main__":
-    G = generate_wattz_strogatz(1000, 6, 0.3)
+@nx.utils.decorators.py_random_state(2)
+def generate_barabasi_albert(n, m, seed=None):
+    """ As taken from NetworkX random_graph src code and modified.
+
+    > SCALE FREE graph.
+    """
+    if m < 1 or m >= n:
+        raise nx.NetworkXError("Barabási–Albert network must have m >= 1"
+                               " and m < n, m = %d, n = %d" % (m, n))
+
+    # Target nodes for new edges
+    targets = [Node(i, 500) for i in range(m)]
+
+    # Add m initial nodes (m0 in barabasi-speak)
+    G = nx.DiGraph()
+    G.add_nodes_from(targets)
+
+    # List of existing nodes, with nodes repeated once for each adjacent edge
+    repeated_nodes = []
+    # Start adding the other n-m nodes. The first node is m.
+    source = m
+    while source < n:
+        src_node = Node(source, 500)
+        # Add edges to m nodes from the source.
+        pairs = list(zip([src_node] * m, targets))
+        for pair in pairs:
+            G.add_edge(pair[0], pair[1], equity=20, fees=[1, 0.05])
+            G.add_edge(pair[1], pair[0], equity=10, fees=[1, 0.05])
+
+        # Add one node to the list for each new edge just created.
+        repeated_nodes.extend(targets)
+        # And the new node "source" has m edges to add to the list.
+        repeated_nodes.extend([src_node] * m)
+        # Now choose m unique nodes from the existing nodes
+        # Pick uniformly from repeated_nodes (preferential attachment)
+        targets = _random_subset(repeated_nodes, m, seed)
+        source += 1
+    return G
+
+def test_simulator():
+    #G = generate_wattz_strogatz(NUM_NODES, 6, 0.3)
+    G = generate_barabasi_albert(NUM_NODES, floor(NUM_NODES / 4))
     nodes = list(G)
     a, b = nodes[0], nodes[10]
     # first = next(iter(G[a]))
-    a.make_payment(G, b, 10)
+    a.make_payment(G, b, 5)
     # nx.draw(G)
     # plt.show()
+
+if __name__ == "__main__":
+    test_simulator()
