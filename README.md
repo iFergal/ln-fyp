@@ -1,10 +1,12 @@
 # Lightning Network Simulator
 Intended to show the benefits of atomic multi-path payments on the Lightning Network and its impact on the success rate of payments.
 
+**N.B.** Need to figure out how to attempt new payment paths after some keep repeatedly failing. And in case of AMP, next choice path maybe shouldn't be the same as previous? Or should it try at least once. Hard to know. Maybe on the fly calculations of virtually deducting the amnt you previously sent when finding the path - difficult.
+
 ## Roadmap
 #### Sections
-1. **Core functionality:** nodes & channel initalisation, route finding, fees per hop calculations, payments.
-2. **Simulation:** topology generation, initial equity distribution, payment distributions, network latency, threading, configuration, logging & analysis, real graphs.
+1. **Core functionality:** nodes & channel initalisation, route finding, fees per hop calculations, payments, offline nodes mid transactions.
+2. **Simulation:** topology generation, initial equity distribution, payment distributions, fee distribution, offline node distribution, network latency, threading, configuration, logging & analysis, real graphs.
 
 #### Essential
 - Create basic network/graph of nodes, with edges representing payment channels of equity and allow for (attempt at least) transfer of regular payments between nodes.
