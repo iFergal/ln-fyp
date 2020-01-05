@@ -9,8 +9,6 @@ import time
 Units of transfer are presumed to be satoshi (0.00000001 BTC) - this is the smallest unit
 available on BTC - in reality, the LN supports millisatoshi for fee rounding purposes.
 -- Hence, fees are allowed be in the order of 0.0001 sat.
-
-N.B :- possible change here; LN-Daemon uses millisatoshi as base unit.
 """
 
 """
@@ -19,7 +17,7 @@ CONFIGURATION
 /////////////
 """
 
-NUM_NODES = 100
+NUM_NODES = 2000  # Spirtes paper uses 2k
 MAX_HOPS = 20
 AMP_TIMEOUT = 0.5  # 60 seconds in c-lightning, 0.5 for now
 
@@ -36,7 +34,7 @@ class Node:
     def __init__(self, id):
         self._id = id
 
-    def update_chan(self, G, dest, amnt, htlc=False):
+    def update_chan(self, G, dest, amnt, htlc=False, test_payment=False):
         """Update a channel's balance by making a payment from src to dest.
 
         We assume both parties sign the update automatically for simulation purposes.
@@ -45,8 +43,11 @@ class Node:
         if G.has_edge(self, dest):
             # Assume: amnt > 0, check for available funds only
             if G[self][dest]["equity"] >= amnt:
+                if test_payment: return True
+
                 G[self][dest]["equity"] -= amnt
                 if not htlc: G[dest][self]["equity"] += amnt
+
                 return True
             else:
                 print("Error: equity between %s and %s not available for transfer." % (self, dest))
@@ -54,12 +55,13 @@ class Node:
             print("Error: no direct payment channel between %s and %s." % (self, dest))
         return False
 
-    def _make_payment(self, G, dest, amnt, subpayment=False):
+    def _make_payment(self, G, dest, amnt, subpayment=False, test_payment=False):
         """Make a regular single payment from this node to destination node of amnt.
 
         subpayment: True if part of AMP.
 
-        Return True if successful, False otherwise.
+        Returns True if successful, False otherwise,
+        or if part of an AMP, returns the path and amounts sent for future reference.
         """
         # Reduce graph to edges with enough equity - this is very costly - fix.
         searchable = nx.DiGraph(((src, tar, attr) for src, tar, attr in G.edges(data=True) \
@@ -76,10 +78,11 @@ class Node:
                 return False
 
             for i in range(len(path)-1):
-                hop = path[i].update_chan(G, path[i+1], send_amnts[i], True)
+                hop = path[i].update_chan(G, path[i+1], send_amnts[i], False, True)
                 if hop:
-                    print("Sent %f from %s to %s." % (send_amnts[i], path[i], path[i+1]))
+                    if not test_payment: print("Sent %f from %s to %s." % (send_amnts[i], path[i], path[i+1]))
                 else:
+                    if test_payment: return False
                     print("Payment failed.")
 
                     # Need to reverse the HTLCs
@@ -93,8 +96,10 @@ class Node:
             print("No route available.")
             return False
 
+        if test_payment: return True
+
         # Successful so need to release all HTLCs, so run through path again
-        # But only right now if not an AMP subpayment
+        # But only right now if not an AMP subpayment (and not a test payment)
         if not subpayment:
             path = path[::-1]  # Reversed as secret revealed from receiver side
             for i in range(len(path)-1):
@@ -106,7 +111,7 @@ class Node:
         else:
             return path, send_amnts
 
-    def make_payment(self, G, dest, amnt, k=1):
+    def make_payment(self, G, dest, amnt, k=1, test_payment=False):
         """Make a payment from this node to destination node of amnt.
 
         May be split by into k different packets [ AMP ].
@@ -114,7 +119,7 @@ class Node:
         Returns True if successful, False otherwise.
         """
         if k == 1:
-            return self._make_payment(G, dest, amnt)
+            return self._make_payment(G, dest, amnt, False, test_payment)
         else:  # AMP
             amnts = [floor(amnt / k) for _ in range(k-1)]
             last = amnt - sum(amnts)
@@ -296,12 +301,13 @@ def generate_barabasi_albert(n, m, seed=None):
     return G, edge_pairs
 
 def test_simulator():
-    # G, pairs = generate_wattz_strogatz(NUM_NODES, 6, 0.3)
-    G, pairs = generate_barabasi_albert(NUM_NODES, floor(NUM_NODES / 4))
+    G, pairs = generate_wattz_strogatz(NUM_NODES, 6, 0.3)
+    # G, pairs = generate_barabasi_albert(NUM_NODES, floor(NUM_NODES / 4))
     nodes = list(G)
     a, b = nodes[0], nodes[10]
     # first = next(iter(G[a]))
-    print(a.make_payment(G, b, 5, 3))
+    print(calc_g_unbalance(G, pairs))
+    print(a.make_payment(G, b, 5, 1))
     print(calc_g_unbalance(G, pairs))
     # nx.draw(G)
     # plt.show()
