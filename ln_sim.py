@@ -20,6 +20,7 @@ CONFIGURATION
 NUM_NODES = 100  # Spirtes paper uses 2k
 MAX_HOPS = 20
 AMP_TIMEOUT = 0.5  # 60 seconds in c-lightning, 0.5 for now
+DEBUG = True
 
 
 """
@@ -50,9 +51,9 @@ class Node:
 
                 return True
             else:
-                print("Error: equity between %s and %s not available for transfer." % (self, dest))
+                if DEBUG: print("Error: equity between %s and %s not available for transfer." % (self, dest))
         else:
-            print("Error: no direct payment channel between %s and %s." % (self, dest))
+            if DEBUG: print("Error: no direct payment channel between %s and %s." % (self, dest))
         return False
 
     def _make_payment(self, G, dest, amnt, subpayment=False, test_payment=False, failed_routes=[]):
@@ -73,7 +74,7 @@ class Node:
         """
         # Reduce graph to edges with enough equity - this is very costly - fix.
         searchable = nx.DiGraph(((src, tar, attr) for src, tar, attr in G.edges(data=True) \
-                                if G[src][tar]["equity"] + G[tar][src]["equity"] > amnt))
+                                if G[src][tar]["equity"] + G[tar][src]["equity"] >= amnt))
 
         # Finds shortest path based on lowest fees, for now.
         if self in searchable and dest in searchable and nx.has_path(searchable, self, dest):
@@ -82,35 +83,35 @@ class Node:
                         if p not in failed_routes]
 
             if len(paths) == 0:
-                print("Error: all shortest routes exhausted [%d]." % subpayment)
+                if DEBUG: print("Error: all shortest routes exhausted [%d]." % subpayment)
                 return False, None
 
             path = paths[0]
             send_amnts = calc_path_fees(G, path, amnt)
 
             if len(path) - 1 > MAX_HOPS:  # LN standard
-                print("Error: path exceeds max-hop distance [%d]." % subpayment)
+                if DEBUG: print("Error: path exceeds max-hop distance [%d]." % subpayment)
                 return False
 
             for i in range(len(path)-1):
                 hop = path[i].update_chan(G, path[i+1], send_amnts[i], True)
                 if hop:
-                    if not test_payment: print("Sent %f from %s to %s. [%d]" % (send_amnts[i], path[i], path[i+1], subpayment))
+                    if not test_payment and DEBUG: print("Sent %f from %s to %s. [%d]" % (send_amnts[i], path[i], path[i+1], subpayment))
                 else:
                     failed_routes.append(path)
 
                     if not test_payment:
-                        print("Error: Payment failed [%d]." % subpayment)
+                        if DEBUG: print("Error: Payment failed [%d]." % subpayment)
 
                         # Need to reverse the HTLCs
                         for j in range(i):
                             # We know path exists from above - need to recheck if implementing closure of channels
                             G[path[i-j-1]][path[i-j]]["equity"] += send_amnts[i-j-1]
-                            print("%s claimed back %f from payment to %s. [%d]" % (path[i-j-1], send_amnts[i-j-1], path[i-j], subpayment))
+                            if DEBUG: print("%s claimed back %f from payment to %s. [%d]" % (path[i-j-1], send_amnts[i-j-1], path[i-j], subpayment))
 
                     return False, failed_routes if subpayment else False
         else:
-            print("No route available.")
+            if DEBUG: print("No route available.")
             return False, failed_routes if subpayment else False
 
         if test_payment: return True
@@ -122,7 +123,7 @@ class Node:
             for i in range(len(path)-1):
                 # We know path exists from above - need to recheck if implementing closure of channels
                 G[path[i]][path[i+1]]["equity"] += send_amnts[i]
-                print("Released %f for %s." % (send_amnts[i], path[i+1]))
+                if DEBUG: print("Released %f for %s." % (send_amnts[i], path[i+1]))
 
             return True
         else:
@@ -142,26 +143,26 @@ class Node:
             last = amnt - sum(amnts)
             amnts.append(last)
 
-            subp_statuses = [[False, []] for _ in range(len(amnts))]
+            subp_statuses = [(False, []) for _ in range(len(amnts))]
 
             ttl = time.time() + AMP_TIMEOUT  # After timeout, attempt at AMP cancelled
 
             # Keep trying to send
             while any(False in subp for subp in subp_statuses):
-                # Taking too long - n.b. all payments need to be returned!
+                # Taking too long - n.b. all subpayments need to be returned!
                 # In Rusty Russell podcast - c-lightning is 60 seconds.
-                if time.time() > ttl or [False, None] in subp_statuses:
-                    print("AMP taking too long... releasing back funds.")
-                    for i, (subp, amnt) in enumerate(zip(subp_statuses, amnts)):
-                        has_paid = subp[0]
-                        if has_paid:
-                            path = has_paid[0][::-1]
-                            send_amnts = has_paid[1][::-1]
+                if time.time() > ttl or (False, None) in subp_statuses:
+                    if DEBUG: print("AMP taking too long... releasing back funds.")
+                    for i, subp in enumerate(subp_statuses):
+                        path = subp[0]
+                        if path:
+                            path = path[::-1]
+                            send_amnts = subp[1][::-1]
 
                             # Need to reverse the HTLCs
                             for j in range(0, len(path)-1):
                                 G[path[j+1]][path[j]]["equity"] += send_amnts[j]
-                                print("%s claimed back %f from payment to %s." % (path[j+1], send_amnts[j], path[j]))
+                                if DEBUG: print("%s claimed back %f from payment to %s." % (path[j+1], send_amnts[j], path[j]))
                     return False
 
                 for i, (subp, amnt) in enumerate(zip(subp_statuses, amnts)):
@@ -179,8 +180,18 @@ class Node:
                 for i in range(len(path)-1):
                     # We know path exists from above - need to recheck if implementing closure of channels
                     G[path[i]][path[i+1]]["equity"] += send_amnts[i]
-                    print("Released %f for %s." % (send_amnts[i], path[i+1]))
+                    if DEBUG: print("Released %f for %s." % (send_amnts[i], path[i+1]))
             return True
+
+    def get_total_equity(self, G):
+        """Returns the total equity held by a node (not locked up in HTLCs)."""
+        out_edges = G.out_edges(self)
+        total = 0
+
+        for out_edge in out_edges:
+            total += G[self][out_edge[1]]["equity"]
+
+        return total
 
     def __str__(self):
         return "Node %d" % self._id
@@ -315,15 +326,18 @@ def generate_barabasi_albert(n, m, seed=None):
         source += 1
     return G, edge_pairs
 
-def test_simulator():
-    # G, pairs = generate_wattz_strogatz(NUM_NODES, 6, 0.3)
-    G, pairs = generate_barabasi_albert(NUM_NODES, floor(NUM_NODES / 4))
+def simulator():
+    G, pairs = generate_wattz_strogatz(NUM_NODES, 6, 0.3)
+    # G, pairs = generate_barabasi_albert(NUM_NODES, floor(NUM_NODES / 4))
     nodes = list(G)
     a, b = nodes[0], nodes[10]
+    print(a.get_total_equity(G))
     # first = next(iter(G[a]))
     print(calc_g_unbalance(G, pairs))
-    print(a.make_payment(G, b, 25, 3))
+    print(a.make_payment(G, b, 20, 3))
     print(calc_g_unbalance(G, pairs))
+
+    print(a.get_total_equity(G))
     # nx.draw(G)
     # plt.show()
 
@@ -359,5 +373,5 @@ def test_func():
 
 
 if __name__ == "__main__":
-    test_simulator()
+    simulator()
     # test_func()
