@@ -1,5 +1,5 @@
 import networkx as nx
-from networkx.algorithms.shortest_paths.weighted import dijkstra_path as dijkstra_path
+from networkx.algorithms.shortest_paths.generic import all_shortest_paths
 from networkx.generators.random_graphs import _random_subset
 import matplotlib.pyplot as plt
 from math import inf, floor
@@ -17,7 +17,7 @@ CONFIGURATION
 /////////////
 """
 
-NUM_NODES = 2000  # Spirtes paper uses 2k
+NUM_NODES = 100  # Spirtes paper uses 2k
 MAX_HOPS = 20
 AMP_TIMEOUT = 0.5  # 60 seconds in c-lightning, 0.5 for now
 
@@ -35,7 +35,7 @@ class Node:
         self._id = id
 
     def update_chan(self, G, dest, amnt, htlc=False, test_payment=False):
-        """Update a channel's balance by making a payment from src to dest.
+        """Update a channel's balance by making a payment from src (self) to dest.
 
         We assume both parties sign the update automatically for simulation purposes.
         Return True if successful, False otherwise.
@@ -55,13 +55,21 @@ class Node:
             print("Error: no direct payment channel between %s and %s." % (self, dest))
         return False
 
-    def _make_payment(self, G, dest, amnt, subpayment=False, test_payment=False):
+    def _make_payment(self, G, dest, amnt, subpayment=False, test_payment=False, failed_routes=[]):
         """Make a regular single payment from this node to destination node of amnt.
 
         subpayment: True if part of AMP.
 
-        Returns True if successful, False otherwise,
-        or if part of an AMP, returns the path and amounts sent for future reference.
+        Returns:
+            - if regular:
+                - True if successful,
+                - False otherwise.
+            - if subpayment of AMP:
+                - the path and amounts sent if successful (for future reference) - or just True if test_payment,
+                - False, failed_routes otherwise (False, None if all routes exhausted).
+
+        Returns True if successful, False, failed_routes otherwise,
+        or if part of an AMP and successful, returns the path and amounts sent for future reference.
         """
         # Reduce graph to edges with enough equity - this is very costly - fix.
         searchable = nx.DiGraph(((src, tar, attr) for src, tar, attr in G.edges(data=True) \
@@ -69,32 +77,41 @@ class Node:
 
         # Finds shortest path based on lowest fees, for now.
         if self in searchable and dest in searchable and nx.has_path(searchable, self, dest):
-            path = dijkstra_path(searchable, self, dest, \
-                    weight=lambda u, v, d: d["fees"][0] + d["fees"][1] * amnt)
+            paths = [p for p in all_shortest_paths(searchable, self, dest, \
+                        weight=lambda u, v, d: d["fees"][0] + d["fees"][1] * amnt) \
+                        if p not in failed_routes]
+
+            if len(paths) == 0:
+                print("Error: all shortest routes exhausted [%d]." % subpayment)
+                return False, None
+
+            path = paths[0]
             send_amnts = calc_path_fees(G, path, amnt)
 
             if len(path) - 1 > MAX_HOPS:  # LN standard
-                print("Error: path exceeds max-hop distance.")
+                print("Error: path exceeds max-hop distance [%d]." % subpayment)
                 return False
 
             for i in range(len(path)-1):
-                hop = path[i].update_chan(G, path[i+1], send_amnts[i], False, True)
+                hop = path[i].update_chan(G, path[i+1], send_amnts[i], True)
                 if hop:
-                    if not test_payment: print("Sent %f from %s to %s." % (send_amnts[i], path[i], path[i+1]))
+                    if not test_payment: print("Sent %f from %s to %s. [%d]" % (send_amnts[i], path[i], path[i+1], subpayment))
                 else:
-                    if test_payment: return False
-                    print("Payment failed.")
+                    failed_routes.append(path)
 
-                    # Need to reverse the HTLCs
-                    for j in range(i):
-                        # We know path exists from above - need to recheck if implementing closure of channels
-                        G[path[i-j-1]][path[i-j]]["equity"] += send_amnts[i-j-1]
-                        print("%s claimed back %f from payment to %s." % (path[i-j-1], send_amnts[i-j-1], path[i-j]))
+                    if not test_payment:
+                        print("Error: Payment failed [%d]." % subpayment)
 
-                    return False
+                        # Need to reverse the HTLCs
+                        for j in range(i):
+                            # We know path exists from above - need to recheck if implementing closure of channels
+                            G[path[i-j-1]][path[i-j]]["equity"] += send_amnts[i-j-1]
+                            print("%s claimed back %f from payment to %s. [%d]" % (path[i-j-1], send_amnts[i-j-1], path[i-j], subpayment))
+
+                    return False, failed_routes if subpayment else False
         else:
             print("No route available.")
-            return False
+            return False, failed_routes if subpayment else False
 
         if test_payment: return True
 
@@ -125,20 +142,18 @@ class Node:
             last = amnt - sum(amnts)
             amnts.append(last)
 
-            subp_statuses = [False] * len(amnts)
-
-            # @TODO: subpayments aren't actually successful here until all make it
-            # So, need to have a flag at receiver that says don't release preimage.
+            subp_statuses = [[False, []] for _ in range(len(amnts))]
 
             ttl = time.time() + AMP_TIMEOUT  # After timeout, attempt at AMP cancelled
 
             # Keep trying to send
-            while False in subp_statuses:
-                # Taking too long - n.b. all payments need to be returned!!
+            while any(False in subp for subp in subp_statuses):
+                # Taking too long - n.b. all payments need to be returned!
                 # In Rusty Russell podcast - c-lightning is 60 seconds.
-                if time.time() > ttl:
+                if time.time() > ttl or [False, None] in subp_statuses:
                     print("AMP taking too long... releasing back funds.")
-                    for i, (has_paid, amnt) in enumerate(zip(subp_statuses, amnts)):
+                    for i, (subp, amnt) in enumerate(zip(subp_statuses, amnts)):
+                        has_paid = subp[0]
                         if has_paid:
                             path = has_paid[0][::-1]
                             send_amnts = has_paid[1][::-1]
@@ -149,9 +164,9 @@ class Node:
                                 print("%s claimed back %f from payment to %s." % (path[j+1], send_amnts[j], path[j]))
                     return False
 
-                for i, (has_paid, amnt) in enumerate(zip(subp_statuses, amnts)):
-                    if not has_paid:
-                        res = self._make_payment(G, dest, amnt, True)
+                for i, (subp, amnt) in enumerate(zip(subp_statuses, amnts)):
+                    if not subp[0]:
+                        res = self._make_payment(G, dest, amnt, i+1, False, subp[1])
                         subp_statuses[i] = res
 
             # All subpayments successful, so receiver knows base preimage to all subpayments
@@ -225,20 +240,20 @@ def generate_wattz_strogatz(n, k, p, seed=None):
 
     edge_pairs = set()
 
-    # connect each node to k/2 neighbours
+    # Connect each node to k/2 neighbours
     for j in range(1, k // 2 + 1):
-        targets = nodes[j:] + nodes[0:j]  # first j nodes are now last in list
+        targets = nodes[j:] + nodes[0:j]  # First j nodes are now last in list
         pairs = list(zip(nodes, targets))
         for pair in pairs:
             G.add_edge(pair[0], pair[1], equity=20, fees=[0.1, 0.005])
             G.add_edge(pair[1], pair[0], equity=10, fees=[0.1, 0.005])
             edge_pairs.add((pair[0], pair[1]))
 
-    # rewire edges from each node
-    # loop over all nodes in order (label) and neighbours in order (distance)
-    # no self loops or multiple edges allowed
-    for j in range(1, k // 2 + 1):  # outer loop is neighbours
-        targets = nodes[j:] + nodes[0:j]  # first j nodes are now last in list
+    # Rewire edges from each node
+    # Loop over all nodes in order (label) and neighbours in order (distance)
+    # No self loops or multiple edges allowed
+    for j in range(1, k // 2 + 1):  # Outer loop is neighbours
+        targets = nodes[j:] + nodes[0:j]  # First j nodes are now last in list
         # inner loop in node order
         for u, v in zip(nodes, targets):
             if seed.random() < p:
@@ -247,7 +262,7 @@ def generate_wattz_strogatz(n, k, p, seed=None):
                 while w == u or G.has_edge(u, w):
                     w = seed.choice(nodes)
                     if G.degree(u) >= n - 1:
-                        break  # skip this rewiring
+                        break  # Skip this rewiring
                 else:
                     G.remove_edge(u, v)
                     G.remove_edge(v, u)
@@ -301,16 +316,48 @@ def generate_barabasi_albert(n, m, seed=None):
     return G, edge_pairs
 
 def test_simulator():
-    G, pairs = generate_wattz_strogatz(NUM_NODES, 6, 0.3)
-    # G, pairs = generate_barabasi_albert(NUM_NODES, floor(NUM_NODES / 4))
+    # G, pairs = generate_wattz_strogatz(NUM_NODES, 6, 0.3)
+    G, pairs = generate_barabasi_albert(NUM_NODES, floor(NUM_NODES / 4))
     nodes = list(G)
     a, b = nodes[0], nodes[10]
     # first = next(iter(G[a]))
     print(calc_g_unbalance(G, pairs))
-    print(a.make_payment(G, b, 5, 1))
+    print(a.make_payment(G, b, 25, 3))
     print(calc_g_unbalance(G, pairs))
     # nx.draw(G)
     # plt.show()
 
+
+"""
+//////////////////////////
+CORE FUNCTIONALITY TESTING
+//////////////////////////
+"""
+
+def test_func():
+    # A-B-C-D graph
+    G = nx.DiGraph()
+    targets = [Node(i) for i in range(4)]
+    G.add_nodes_from(targets)
+
+    nodes = list(G)
+
+    G.add_edge(nodes[0], nodes[1], equity=20, fees=[0.1, 0.005])
+    G.add_edge(nodes[1], nodes[0], equity=10, fees=[0.1, 0.005])
+
+    G.add_edge(nodes[1], nodes[2], equity=20, fees=[0.1, 0.005])
+    G.add_edge(nodes[2], nodes[1], equity=10, fees=[0.1, 0.005])
+
+    G.add_edge(nodes[2], nodes[3], equity=20, fees=[0.1, 0.005])
+    G.add_edge(nodes[3], nodes[2], equity=10, fees=[0.1, 0.005])
+
+    edges = G.edges
+
+    # A-D, pay 10
+    nodes[0].make_payment(G, nodes[3], 10)
+    print(edges)
+
+
 if __name__ == "__main__":
     test_simulator()
+    # test_func()
