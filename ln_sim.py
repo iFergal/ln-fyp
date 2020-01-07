@@ -10,6 +10,7 @@ import time
 Units of transfer are presumed to be satoshi (0.00000001 BTC) - this is the smallest unit
 available on BTC - in reality, the LN supports millisatoshi for fee rounding purposes.
 -- Hence, fees are allowed be in the order of 0.0001 sat.
+   @TODO: need to enforce ^ and how rounding works.
 """
 
 """
@@ -196,11 +197,12 @@ class Node:
                 send_amnts = subpayment[1]
 
                 path = path[::-1]  # Reversed as secret revealed from receiver side
+                send_amnts = send_amnts[::-1]
                 for i in range(len(path)-1):
                     time.sleep(path[i].get_latency())  # Reveal R latency
                     # We know path exists from above - need to recheck if implementing closure of channels
                     G[path[i]][path[i+1]]["equity"] += send_amnts[i]
-                    if DEBUG: print("Released %f for %s." % (send_amnts[i], path[i+1]))
+                    if DEBUG: print("Released %f from HTLC to %s." % (send_amnts[i], path[i]))
             return True
 
     def get_total_equity(self, G):
@@ -455,7 +457,6 @@ def test_func():
     # No route available
     assert nodes[0]._make_payment(G, nodes[14], 100, DEBUG=TEST_DEBUG) == False
 
-
     # One-hop payments - make sure finds direct path.
     path = [nodes[11], nodes[9]]
     amnts = calc_path_fees(G, path, 5)
@@ -468,17 +469,81 @@ def test_func():
     assert G[nodes[11]][nodes[9]]["equity"] == e_11_9 - amnts[0]
     assert G[nodes[9]][nodes[11]]["equity"] == e_9_11 + amnts[0]
 
-    TEST_DEBUG = True
-    # print(graph_str(G))
 
-    # nx.draw_networkx(G)
-    # plt.show()
+    ################## func: make_payment [AMP] ################
+    # Re-init just in case
+    G, pairs = generate_wattz_strogatz(NUM_TEST_NODES, 6, 0.3, 10)
+    nodes = list(G)
 
-    # # A-D, pay 10
-    # nodes[0].make_payment(G, nodes[3], 10)
-    # print(edges)
+    # From above, we've already tested that single payments work and if they fail revert correctly
+    # So, for AMP - need to check:
+    #   1) split payment that works straight off
+    #   2) fails, retries routes and works
+    #   3) fails overall with subpayments that didn't fail reverting
 
+    # Works with no fails - right now, this means it tries same route and keeps working.
+    # Again 0-1-14 sent as packets of 3/3/4
+    path = [nodes[0], nodes[1], nodes[14]]
+    amnts = calc_path_fees(G, path, 3)
+    amnts_2 = calc_path_fees(G, path, 4)
+
+    e_0_1 = G[nodes[0]][nodes[1]]["equity"]
+    e_1_0 = G[nodes[1]][nodes[0]]["equity"]
+    e_1_14 = G[nodes[1]][nodes[14]]["equity"]
+    e_14_1 = G[nodes[14]][nodes[1]]["equity"]
+
+    nodes[0].make_payment(G, nodes[14], 10, k=3, test_payment=True, DEBUG=TEST_DEBUG)
+
+    assert G[nodes[0]][nodes[1]]["equity"] == e_0_1 - amnts[0] * 2 - amnts_2[0]
+    assert G[nodes[1]][nodes[0]]["equity"] == e_1_0 + amnts[0] * 2 + amnts_2[0]
+    assert G[nodes[1]][nodes[14]]["equity"] == e_1_14 - amnts[1] * 2 - amnts_2[1]
+    assert G[nodes[14]][nodes[1]]["equity"] == e_14_1 + amnts[1] * 2 + amnts_2[1]
+
+    # Try same payment again - will work for subpayments but last payment will fail
+    # First 2 subpayments reverted - so should be same as above.
+    # Stops when all routes exhausted - will also stop if taking too long - no need to test this.
+    # @TODO: If better pathfinding implemented this will probably break.
+    nodes[0].make_payment(G, nodes[14], 10, k=3, test_payment=True, DEBUG=TEST_DEBUG)
+
+    assert G[nodes[0]][nodes[1]]["equity"] == e_0_1 - amnts[0] * 2 - amnts_2[0]
+    assert G[nodes[1]][nodes[0]]["equity"] == e_1_0 + amnts[0] * 2 + amnts_2[0]
+    assert G[nodes[1]][nodes[14]]["equity"] == e_1_14 - amnts[1] * 2 - amnts_2[1]
+    assert G[nodes[14]][nodes[1]]["equity"] == e_14_1 + amnts[1] * 2 + amnts_2[1]
+
+    # Try a payment that has failed routes, but finds enough other routes to
+    # successfully route the payment - reset so we can use same route.
+    G, pairs = generate_wattz_strogatz(NUM_TEST_NODES, 6, 0.3, 10)
+    nodes = list(G)
+
+    # Sent as 5/5/5 - alternative route 0-19-14 for last payment.
+    path = [nodes[0], nodes[1], nodes[14]]
+    amnts = calc_path_fees(G, path, 5)
+
+    path = [nodes[0], nodes[19], nodes[14]]
+    amnts_2 = calc_path_fees(G, path, 5)
+
+    e_0_1 = G[nodes[0]][nodes[1]]["equity"]
+    e_1_0 = G[nodes[1]][nodes[0]]["equity"]
+    e_1_14 = G[nodes[1]][nodes[14]]["equity"]
+    e_14_1 = G[nodes[14]][nodes[1]]["equity"]
+    e_0_19 = G[nodes[0]][nodes[19]]["equity"]
+    e_19_0 = G[nodes[19]][nodes[0]]["equity"]
+    e_19_14 = G[nodes[19]][nodes[14]]["equity"]
+    e_14_19 = G[nodes[14]][nodes[19]]["equity"]
+
+    nodes[0].make_payment(G, nodes[14], 15, k=3, test_payment=True, DEBUG=TEST_DEBUG)
+
+    # 2 on 0-1-14, 1 on 0-19-14
+    assert G[nodes[0]][nodes[1]]["equity"] == e_0_1 - amnts[0] * 2
+    assert G[nodes[1]][nodes[0]]["equity"] == e_1_0 + amnts[0] * 2
+    assert G[nodes[1]][nodes[14]]["equity"] == e_1_14 - amnts[1] * 2
+    assert G[nodes[14]][nodes[1]]["equity"] == e_14_1 + amnts[1] * 2
+    assert G[nodes[0]][nodes[19]]["equity"] == e_0_19 - amnts_2[0]
+    assert G[nodes[19]][nodes[0]]["equity"] == e_19_0 + amnts_2[0]
+    assert G[nodes[19]][nodes[14]]["equity"] == e_19_14 - amnts_2[1]
+    assert G[nodes[14]][nodes[19]]["equity"] == e_14_19 + amnts_2[1]
 
 if __name__ == "__main__":
-    # simulator()
     test_func()
+
+# simulator()
