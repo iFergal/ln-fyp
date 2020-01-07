@@ -1,4 +1,5 @@
 import networkx as nx
+import numpy as np
 from networkx.algorithms.shortest_paths.generic import all_shortest_paths
 from networkx.generators.random_graphs import _random_subset
 import matplotlib.pyplot as plt
@@ -18,6 +19,7 @@ CONFIGURATION
 """
 
 NUM_NODES = 100  # Spirtes paper uses 2k
+NUM_TEST_NODES = 20
 MAX_HOPS = 20
 AMP_TIMEOUT = 0.5  # 60 seconds in c-lightning, 0.5 for now
 DEBUG = True
@@ -36,10 +38,13 @@ class Node:
         self._id = id
         self._latency = latency
 
+    def get_id(self):
+        return self._id
+
     def get_latency(self):
         return self._latency
 
-    def update_chan(self, G, dest, amnt, htlc=False, test_payment=False):
+    def update_chan(self, G, dest, amnt, htlc=False, test_payment=False, DEBUG=DEBUG):
         """Update a channel's balance by making a payment from src (self) to dest.
 
         We assume both parties sign the update automatically for simulation purposes.
@@ -60,7 +65,7 @@ class Node:
             if DEBUG: print("Error: no direct payment channel between %s and %s." % (self, dest))
         return False
 
-    def _make_payment(self, G, dest, amnt, subpayment=False, test_payment=False, failed_routes=[]):
+    def _make_payment(self, G, dest, amnt, subpayment=False, test_payment=False, failed_routes=[], DEBUG=DEBUG):
         """Make a regular single payment from this node to destination node of amnt.
 
         subpayment: True if part of AMP.
@@ -71,35 +76,38 @@ class Node:
                 - False otherwise.
             - if subpayment of AMP:
                 - the path and amounts sent if successful (for future reference) - or just True if test_payment,
-                - False, failed_routes otherwise (False, None if all routes exhausted).
-
-        Returns True if successful, False, failed_routes otherwise,
-        or if part of an AMP and successful, returns the path and amounts sent for future reference.
+                - False, failed_routes otherwise (False, None if all routes exhausted or none exist).
         """
         # Reduce graph to edges with enough equity - this is very costly - fix.
         searchable = nx.DiGraph(((src, tar, attr) for src, tar, attr in G.edges(data=True) \
                                 if G[src][tar]["equity"] + G[tar][src]["equity"] >= amnt))
 
         # Finds shortest path based on lowest fees, for now.
-        if self in searchable and dest in searchable and nx.has_path(searchable, self, dest):
+        if self in searchable and dest in searchable:
             paths = [p for p in all_shortest_paths(searchable, self, dest, \
                         weight=lambda u, v, d: d["fees"][0] + d["fees"][1] * amnt) \
                         if p not in failed_routes]
 
             if len(paths) == 0:
-                if DEBUG: print("Error: all shortest routes exhausted [%d]." % subpayment)
-                return False, None
+                if DEBUG: print("Error: no remaining possible routes [%d]." % subpayment)
+                if subpayment: return False, None  # None as there are no more routes so stop trying
+                return False
 
             path = paths[0]
-            send_amnts = calc_path_fees(G, path, amnt)
 
             if len(path) - 1 > MAX_HOPS:  # LN standard
                 if DEBUG: print("Error: path exceeds max-hop distance [%d]." % subpayment)
+                failed_routes.append(path)
+
+                if subpayment: return False, failed_routes
                 return False
 
+            send_amnts = calc_path_fees(G, path, amnt)
+
+            # Send out payment - create HTLCs
             for i in range(len(path)-1):
                 time.sleep(path[i].get_latency())  # Need to find out exactly where latency should be applied
-                hop = path[i].update_chan(G, path[i+1], send_amnts[i], True)
+                hop = path[i].update_chan(G, path[i+1], send_amnts[i], True, test_payment, DEBUG=DEBUG)
                 if hop:
                     if not test_payment and DEBUG: print("Sent %f from %s to %s. [%d]" % (send_amnts[i], path[i], path[i+1], subpayment))
                 else:
@@ -115,10 +123,12 @@ class Node:
                             G[path[i-j-1]][path[i-j]]["equity"] += send_amnts[i-j-1]
                             if DEBUG: print("%s claimed back %f from payment to %s. [%d]" % (path[i-j-1], send_amnts[i-j-1], path[i-j], subpayment))
 
-                    return False, failed_routes if subpayment else False
+                    if subpayment: return False, failed_routes
+                    return False
         else:
             if DEBUG: print("No route available.")
-            return False, failed_routes if subpayment else False
+            if subpayment: return False, None  # None as there are no routes so stop trying
+            return False
 
         if test_payment: return True
 
@@ -126,17 +136,18 @@ class Node:
         # But only right now if not an AMP subpayment (and not a test payment)
         if not subpayment:
             path = path[::-1]  # Reversed as secret revealed from receiver side
+            send_amnts = send_amnts[::-1]
             for i in range(len(path)-1):
                 time.sleep(path[i].get_latency())  # Again, need to check - revealing R takes latency too
                 # We know path exists from above - need to recheck if implementing closure of channels
                 G[path[i]][path[i+1]]["equity"] += send_amnts[i]
-                if DEBUG: print("Released %f for %s." % (send_amnts[i], path[i+1]))
+                if DEBUG: print("Released %f to %s." % (send_amnts[i], path[i]))
 
             return True
         else:
             return path, send_amnts
 
-    def make_payment(self, G, dest, amnt, k=1, test_payment=False):
+    def make_payment(self, G, dest, amnt, k=1, test_payment=False, DEBUG=DEBUG):
         """Make a payment from this node to destination node of amnt.
 
         May be split by into k different packets [ AMP ].
@@ -144,7 +155,7 @@ class Node:
         Returns True if successful, False otherwise.
         """
         if k == 1:
-            return self._make_payment(G, dest, amnt, False, test_payment)
+            return self._make_payment(G, dest, amnt, False, test_payment, DEBUG=DEBUG)
         else:  # AMP
             amnts = [floor(amnt / k) for _ in range(k-1)]
             last = amnt - sum(amnts)
@@ -175,7 +186,7 @@ class Node:
 
                 for i, (subp, amnt) in enumerate(zip(subp_statuses, amnts)):
                     if not subp[0]:
-                        res = self._make_payment(G, dest, amnt, i+1, False, subp[1])
+                        res = self._make_payment(G, dest, amnt, i+1, False, subp[1], DEBUG=DEBUG)
                         subp_statuses[i] = res
 
             # All subpayments successful, so receiver knows base preimage to all subpayments
@@ -234,6 +245,19 @@ def calc_g_unbalance(G, pairs):
         total_diff += abs(G[u][v]["equity"] - G[v][u]["equity"])
         total_equity += G[u][v]["equity"] + G[v][u]["equity"]
     return total_diff / total_equity
+
+def graph_str(G):
+    """Return a string representation of graph. """
+    str = "<-----START GRAPH----->\n"
+    nodes = list(G)
+    for node in nodes:
+        str += "[%d] => [" % node.get_id()
+        out_edges = G.out_edges(node)
+        for out_edge in out_edges:
+            str += " {%d/%.2f}" % (out_edge[1].get_id(), G[out_edge[0]][out_edge[1]]["equity"])
+        str += " ]\n"
+    str += "<-----END GRAPH----->"
+    return(str)
 
 
 """
@@ -358,29 +382,103 @@ CORE FUNCTIONALITY TESTING
 """
 
 def test_func():
-    # A-B-C-D graph
-    G = nx.DiGraph()
-    targets = [Node(i, 0) for i in range(4)]
-    G.add_nodes_from(targets)
+    TEST_DEBUG = False
 
+    ################## func: update_chan #######################
+    # Always produces same graph due to seed
+    G, pairs = generate_wattz_strogatz(NUM_TEST_NODES, 6, 0.3, 10)
     nodes = list(G)
 
-    G.add_edge(nodes[0], nodes[1], equity=20, fees=[0.1, 0.005])
-    G.add_edge(nodes[1], nodes[0], equity=10, fees=[0.1, 0.005])
+    # Path exists from 0 -> 2
+    assert nodes[2].get_total_equity(G) == 80
 
-    G.add_edge(nodes[1], nodes[2], equity=20, fees=[0.1, 0.005])
-    G.add_edge(nodes[2], nodes[1], equity=10, fees=[0.1, 0.005])
+    # Straight transfer
+    nodes[0].update_chan(G, nodes[2], 5)
+    assert nodes[0].get_total_equity(G) == 65
+    assert nodes[2].get_total_equity(G) == 85
 
-    G.add_edge(nodes[2], nodes[3], equity=20, fees=[0.1, 0.005])
-    G.add_edge(nodes[3], nodes[2], equity=10, fees=[0.1, 0.005])
+    # HTLC
+    nodes[0].update_chan(G, nodes[2], 5, htlc=True)
+    assert nodes[0].get_total_equity(G) == 60
+    assert nodes[2].get_total_equity(G) == 85
 
-    edges = G.edges
+    # Test payment
+    nodes[2].update_chan(G, nodes[0], 5, test_payment=True)
+    assert nodes[0].get_total_equity(G) == 60
+    assert nodes[2].get_total_equity(G) == 85
 
-    # A-D, pay 10
-    nodes[0].make_payment(G, nodes[3], 10)
-    print(edges)
+    # Not enough equity
+    assert nodes[0].update_chan(G, nodes[2], 20, DEBUG=TEST_DEBUG) == False
+
+
+    ################## func: _make_payment [NON-AMP] ###########
+    # Re-init just in case
+    G, pairs = generate_wattz_strogatz(NUM_TEST_NODES, 6, 0.3, 10)
+    nodes = list(G)
+
+    # Payment from 0 to 14 will find path 0-1-14
+    path = [nodes[0], nodes[1], nodes[14]]
+    amnts = calc_path_fees(G, path, 10)
+
+    # Test payment
+    e_0_1 = G[nodes[0]][nodes[1]]["equity"]
+    e_1_0 = G[nodes[1]][nodes[0]]["equity"]
+    e_1_14 = G[nodes[1]][nodes[14]]["equity"]
+    e_14_1 = G[nodes[14]][nodes[1]]["equity"]
+
+    # When k=1, make_payment calls _make_payment directly
+    nodes[0]._make_payment(G, nodes[14], 10, test_payment=True, DEBUG=TEST_DEBUG)
+
+    assert G[nodes[0]][nodes[1]]["equity"] == e_0_1
+    assert G[nodes[1]][nodes[0]]["equity"] == e_1_0
+    assert G[nodes[1]][nodes[14]]["equity"] == e_1_14
+    assert G[nodes[14]][nodes[1]]["equity"] == e_14_1
+
+    # Real payment
+    nodes[0]._make_payment(G, nodes[14], 10, DEBUG=TEST_DEBUG)
+
+    assert G[nodes[0]][nodes[1]]["equity"] == e_0_1 - amnts[0]
+    assert G[nodes[1]][nodes[0]]["equity"] == e_1_0 + amnts[0]
+    assert G[nodes[1]][nodes[14]]["equity"] == e_1_14 - amnts[1]
+    assert G[nodes[14]][nodes[1]]["equity"] == e_14_1 + amnts[1]
+
+    # There's no more equity from 1 to 14, so try this route again to test
+    # for funds being released back correctly when a route fails mid-way forward.
+    nodes[0]._make_payment(G, nodes[14], 5, DEBUG=TEST_DEBUG)
+
+    # Should be the same as payment only made it one hop.
+    assert G[nodes[0]][nodes[1]]["equity"] == e_0_1 - amnts[0]
+    assert G[nodes[1]][nodes[0]]["equity"] == e_1_0 + amnts[0]
+    assert G[nodes[1]][nodes[14]]["equity"] == e_1_14 - amnts[1]
+    assert G[nodes[14]][nodes[1]]["equity"] == e_14_1 + amnts[1]
+
+    # No route available
+    assert nodes[0]._make_payment(G, nodes[14], 100, DEBUG=TEST_DEBUG) == False
+
+
+    # One-hop payments - make sure finds direct path.
+    path = [nodes[11], nodes[9]]
+    amnts = calc_path_fees(G, path, 5)
+
+    e_11_9 = G[nodes[11]][nodes[9]]["equity"]
+    e_9_11 = G[nodes[9]][nodes[11]]["equity"]
+
+    nodes[11]._make_payment(G, nodes[9], 5, DEBUG=TEST_DEBUG)
+
+    assert G[nodes[11]][nodes[9]]["equity"] == e_11_9 - amnts[0]
+    assert G[nodes[9]][nodes[11]]["equity"] == e_9_11 + amnts[0]
+
+    TEST_DEBUG = True
+    # print(graph_str(G))
+
+    # nx.draw_networkx(G)
+    # plt.show()
+
+    # # A-D, pay 10
+    # nodes[0].make_payment(G, nodes[3], 10)
+    # print(edges)
 
 
 if __name__ == "__main__":
-    simulator()
-    # test_func()
+    # simulator()
+    test_func()
