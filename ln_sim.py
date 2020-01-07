@@ -32,8 +32,12 @@ CORE FUNCTIONALITY
 class Node:
     """ Singular lightning node. """
 
-    def __init__(self, id):
+    def __init__(self, id, latency):
         self._id = id
+        self._latency = latency
+
+    def get_latency(self):
+        return self._latency
 
     def update_chan(self, G, dest, amnt, htlc=False, test_payment=False):
         """Update a channel's balance by making a payment from src (self) to dest.
@@ -94,6 +98,7 @@ class Node:
                 return False
 
             for i in range(len(path)-1):
+                time.sleep(path[i].get_latency())  # Need to find out exactly where latency should be applied
                 hop = path[i].update_chan(G, path[i+1], send_amnts[i], True)
                 if hop:
                     if not test_payment and DEBUG: print("Sent %f from %s to %s. [%d]" % (send_amnts[i], path[i], path[i+1], subpayment))
@@ -105,6 +110,7 @@ class Node:
 
                         # Need to reverse the HTLCs
                         for j in range(i):
+                            time.sleep(path[i-j-1].get_latency())  # Again, need to check
                             # We know path exists from above - need to recheck if implementing closure of channels
                             G[path[i-j-1]][path[i-j]]["equity"] += send_amnts[i-j-1]
                             if DEBUG: print("%s claimed back %f from payment to %s. [%d]" % (path[i-j-1], send_amnts[i-j-1], path[i-j], subpayment))
@@ -121,6 +127,7 @@ class Node:
         if not subpayment:
             path = path[::-1]  # Reversed as secret revealed from receiver side
             for i in range(len(path)-1):
+                time.sleep(path[i].get_latency())  # Again, need to check - revealing R takes latency too
                 # We know path exists from above - need to recheck if implementing closure of channels
                 G[path[i]][path[i+1]]["equity"] += send_amnts[i]
                 if DEBUG: print("Released %f for %s." % (send_amnts[i], path[i+1]))
@@ -161,6 +168,7 @@ class Node:
 
                             # Need to reverse the HTLCs
                             for j in range(0, len(path)-1):
+                                time.sleep(path[j+1].get_latency())  # Again latency to reveal R
                                 G[path[j+1]][path[j]]["equity"] += send_amnts[j]
                                 if DEBUG: print("%s claimed back %f from payment to %s." % (path[j+1], send_amnts[j], path[j]))
                     return False
@@ -178,6 +186,7 @@ class Node:
 
                 path = path[::-1]  # Reversed as secret revealed from receiver side
                 for i in range(len(path)-1):
+                    time.sleep(path[i].get_latency())  # Reveal R latency
                     # We know path exists from above - need to recheck if implementing closure of channels
                     G[path[i]][path[i+1]]["equity"] += send_amnts[i]
                     if DEBUG: print("Released %f for %s." % (send_amnts[i], path[i+1]))
@@ -247,7 +256,7 @@ def generate_wattz_strogatz(n, k, p, seed=None):
         return nx.complete_graph(n)
 
     G = nx.DiGraph()
-    nodes = [Node(i) for i in range(n)]
+    nodes = [Node(i, 0) for i in range(n)]
 
     edge_pairs = set()
 
@@ -295,7 +304,7 @@ def generate_barabasi_albert(n, m, seed=None):
                                " and m < n, m = %d, n = %d" % (m, n))
 
     # Target nodes for new edges
-    targets = [Node(i) for i in range(m)]
+    targets = [Node(i, 0) for i in range(m)]
 
     # Add m initial nodes (m0 in barabasi-speak)
     G = nx.DiGraph()
@@ -308,7 +317,7 @@ def generate_barabasi_albert(n, m, seed=None):
     # Start adding the other n-m nodes. The first node is m.
     source = m
     while source < n:
-        src_node = Node(source)
+        src_node = Node(source, 0)
         # Add edges to m nodes from the source.
         pairs = list(zip([src_node] * m, targets))
         for pair in pairs:
@@ -351,7 +360,7 @@ CORE FUNCTIONALITY TESTING
 def test_func():
     # A-B-C-D graph
     G = nx.DiGraph()
-    targets = [Node(i) for i in range(4)]
+    targets = [Node(i, 0) for i in range(4)]
     G.add_nodes_from(targets)
 
     nodes = list(G)
