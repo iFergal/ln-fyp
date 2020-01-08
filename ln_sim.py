@@ -10,7 +10,6 @@ import time
 Units of transfer are presumed to be satoshi (0.00000001 BTC) - this is the smallest unit
 available on BTC - in reality, the LN supports millisatoshi for fee rounding purposes.
 -- Hence, fees are allowed be in the order of 0.0001 sat.
-   @TODO: need to enforce ^ and how rounding works.
 """
 
 """
@@ -19,7 +18,7 @@ CONFIGURATION
 /////////////
 """
 
-NUM_NODES = 100  # Spirtes paper uses 2k
+NUM_NODES = 2000  # Spirtes paper uses 2k
 NUM_TEST_NODES = 20
 MAX_HOPS = 20  # LN standard
 AMP_TIMEOUT = 60  # 60 seconds in c-lightning
@@ -28,7 +27,7 @@ MERCHANT_PROB = 0.67
 LATENCY_DISTRIBUTION = [0.925, 0.049, 0.026]  # For [100ms, 1s, 10s] - Sprites paper
 
 # Consumers pay merchants - this is the chance for different role,
-# i.e. merchant to pay or consumer to receive, [0, 1] - 1 means both as likely as each other
+# i.e. merchant to pay or consumer to receive, [0, 0.5] - 0.5 means both as likely as each other
 ROLE_BIAS = 0.05
 
 """
@@ -153,7 +152,7 @@ class Node:
                 time.sleep(path[i].get_latency())  # Need to find out exactly where latency should be applied
                 hop = path[i].update_chan(G, path[i+1], send_amnts[i], True, test_payment, debug=debug)
                 if hop:
-                    if not test_payment and debug: print("Sent %f from %s to %s. [%d]" % (send_amnts[i], path[i], path[i+1], subpayment))
+                    if not test_payment and debug: print("Sent %.4f from %s to %s. [%d]" % (send_amnts[i], path[i], path[i+1], subpayment))
                 else:
                     failed_routes.append(path)
 
@@ -165,7 +164,7 @@ class Node:
                             time.sleep(path[i-j-1].get_latency())  # Again, need to check
                             # We know path exists from above - need to recheck if implementing closure of channels
                             G[path[i-j-1]][path[i-j]]["equity"] += send_amnts[i-j-1]
-                            if debug: print("%s claimed back %f from payment to %s. [%d]" % (path[i-j-1], send_amnts[i-j-1], path[i-j], subpayment))
+                            if debug: print("%s claimed back %.4f from payment to %s. [%d]" % (path[i-j-1], send_amnts[i-j-1], path[i-j], subpayment))
 
                     if subpayment: return False, failed_routes
                     return False
@@ -185,7 +184,7 @@ class Node:
                 time.sleep(path[i].get_latency())  # Again, need to check - revealing R takes latency too
                 # We know path exists from above - need to recheck if implementing closure of channels
                 G[path[i]][path[i+1]]["equity"] += send_amnts[i]
-                if debug: print("Released %f to %s." % (send_amnts[i], path[i]))
+                if debug: print("Released %.4f to %s." % (send_amnts[i], path[i]))
 
             return True
         else:
@@ -235,7 +234,7 @@ class Node:
                             for j in range(0, len(path)-1):
                                 time.sleep(path[j+1].get_latency())  # Again latency to reveal R
                                 G[path[j+1]][path[j]]["equity"] += send_amnts[j]
-                                if debug: print("%s claimed back %f from payment to %s." % (path[j+1], send_amnts[j], path[j]))
+                                if debug: print("%s claimed back %.4f from payment to %s." % (path[j+1], send_amnts[j], path[j]))
                     return False
 
                 for i, (subp, amnt) in enumerate(zip(subp_statuses, amnts)):
@@ -255,11 +254,11 @@ class Node:
                     time.sleep(path[i].get_latency())  # Reveal R latency
                     # We know path exists from above - need to recheck if implementing closure of channels
                     G[path[i]][path[i+1]]["equity"] += send_amnts[i]
-                    if debug: print("Released %f from HTLC to %s." % (send_amnts[i], path[i]))
+                    if debug: print("Released %.4f from HTLC to %s." % (send_amnts[i], path[i]))
             return True
 
     def get_total_equity(self, G):
-        """Returns the total equity held by a node (not locked up in HTLCs)."""
+        """Returns the total equity held by a node (not locked up in HTLCs). """
         out_edges = G.out_edges(self)
         total = 0
 
@@ -268,9 +267,23 @@ class Node:
 
         return total
 
+    def get_largest_outgoing_equity(self, G):
+        """Returns the largest equity held by the node in a single payment channel. """
+        out_edges = G.out_edges(self)
+        largest = 0
+
+        for out_edge in out_edges:
+            if G[self][out_edge[1]]["equity"] > largest:
+                largest = G[self][out_edge[1]]["equity"]
+
+        return largest
+
     def __str__(self):
         return "Node %d" % self._id
 
+def floor_msat(satoshi):
+    """Floor to nearest millisatoshi. (lowest possible unit in LN) """
+    return np.round(satoshi - 0.5 * 10**(-4), 4)
 
 def calc_path_fees(G, path, amnt):
     """Calculate the compound path fees required for a given path.
@@ -278,6 +291,7 @@ def calc_path_fees(G, path, amnt):
     Note: compounding as amnt of equity moving per node is different!
 
     Args:
+        G: NetworkX graph in use.
         path: (list<Node>) path for which fees are to be calculated.
         amnt: (float) number of satoshi to send to final Node in path.
 
@@ -288,7 +302,7 @@ def calc_path_fees(G, path, amnt):
     path = path[1:][::-1]  # No fees on first hop, reversed
     for i in range(len(path)-1):
         fees = G[path[i]][path[i+1]]["fees"]
-        fee_this_hop = fees[0] + fees[1] * hop_amnts[-1]
+        fee_this_hop = floor_msat(fees[0] + fees[1] * hop_amnts[-1]) # Fees always floored to nearest msat
         hop_amnts.append(fee_this_hop + hop_amnts[-1])
     return hop_amnts[::-1]
 
@@ -298,6 +312,7 @@ def calc_g_unbalance(G, pairs):
     Higher equity channels take proportionally higher effect on the resultant ratio.
 
     Args:
+        G: NetworkX graph in use.
         pairs: represents payment channels - pairs of nodes (but only one direction so no duplicates)
 
     Returns:
@@ -322,7 +337,8 @@ def graph_str(G):
             str += " {%d/%.2f}" % (out_edge[1].get_id(), G[out_edge[0]][out_edge[1]]["equity"])
         str += " ]\n"
     str += "<-----END GRAPH----->"
-    return(str)
+
+    return str
 
 
 """
@@ -335,7 +351,10 @@ def init_random_node(i):
     """Initialise and return a new node based on given simulation parameters, with given ID i. """
     merchant = np.random.choice([True, False], 1, p=[MERCHANT_PROB, 1 - MERCHANT_PROB])
     latency = np.random.choice([0.1, 1, 10], 1, p=LATENCY_DISTRIBUTION)
-    spend_freq = 1  # unsure how to handle freqs yet
+
+    # Spend and receive freqs are a rating - for consisting in range [0, 1]
+    # 0 - never selected, 1 - as likely as possible.
+    spend_freq = 1
     receive_freq = 1
 
     return Node(i, latency, merchant, spend_freq, receive_freq)
@@ -361,7 +380,8 @@ def generate_wattz_strogatz(n, k, p, seed=None, test=False):
         test: (boolean) True if graph to be generated is for the test function. (False by default)
 
     Returns:
-        the generated graph G.
+        the generated graph G,
+        list of pairs of edges representing payment channels (one-direction, no duplicates).
     """
     if k > n:
         raise nx.NetworkXError("k>n, choose smaller k or larger n")
@@ -433,7 +453,8 @@ def generate_barabasi_albert(n, m, seed=None):
         seed: (int) seed for RNG. (None by default)
 
     Returns:
-        the generated graph G.
+        the generated graph G,
+        list of pairs of edges representing payment channels (one-direction, no duplicates).
     """
     if m < 1 or m >= n:
         raise nx.NetworkXError("Barabási–Albert network must have m >= 1"
@@ -475,12 +496,71 @@ def generate_barabasi_albert(n, m, seed=None):
         source += 1
     return G, edge_pairs
 
+def select_payment_nodes(consumers, merchants, total_freqs):
+    """Select 2 nodes to attempt to pay from src to dest.
+
+    Args:
+        consumers: (list<Node>) consumer nodes within the graph.
+        merchants: (list<Node>) merchant nodes within the graph.
+        total_freq: (list) [sum of consumer spend freqs, sum of merchant spend freqs,
+                            sum of consumer receive freqs, sum of merchant receive freqs]
+
+    Returns:
+        source and destination nodes to make the payment.
+    """
+    # Select src node - True denotes pick consumer
+    src_consumer = np.random.choice([True, False], 1, p=[1 - ROLE_BIAS, ROLE_BIAS])
+    srcs = consumers if src_consumer else merchants
+    total_spend = total_freqs[0] if src_consumer else total_freqs[1]
+    src_node = np.random.choice(srcs, 1, p=[src.get_spend_freq() / total_spend for src in srcs])[0]
+
+    # Select dest node - True denotes pick merchant
+    dest_merchant = np.random.choice([True, False], 1, p=[1 - ROLE_BIAS, ROLE_BIAS])
+    dests = merchants if dest_merchant else consumers
+    total_receive = total_freqs[3] if dest_merchant else total_freqs[2]
+    dest_node = np.random.choice(dests, 1, p=[dest.get_receive_freq() / total_receive for dest in dests])[0]
+
+    return src_node, dest_node
+
+def select_pay_amnt(G, node):
+    """Returns an appropriate spend amount (satoshi) for the selected node.
+
+    Note: @TODO - do we select an always possible amount or allow for auto-failures?
+    """
+    max_amnt = node.get_largest_outgoing_equity(G)
+
+    return np.random.randint(1, max_amnt + 1)
+
 def simulator():
     """Main simulator calling function. """
     G, pairs = generate_wattz_strogatz(NUM_NODES, 6, 0.3)
     # G, pairs = generate_barabasi_albert(NUM_NODES, floor(NUM_NODES / 4))
     nodes = list(G)
-    a, b = nodes[0], nodes[10]
+
+    consumers = []
+    merchants = []
+    total_freqs = [0, 0, 0, 0] # s_c, s_m, r_c, r_m
+    for node in nodes:
+        if node.is_merchant():
+            merchants.append(node)
+            total_freqs[1] += node.get_spend_freq()
+            total_freqs[3] += node.get_receive_freq()
+        else:
+            consumers.append(node)
+            total_freqs[0] += node.get_spend_freq()
+            total_freqs[2] += node.get_receive_freq()
+
+    # Here - select nodes and attempt payments + record
+    # Selected using select_payment_nodes
+    # Need to decide how many satoshi per payment (based on available balance etc?)
+    # Need to decide how to split up payments - trial & error.
+    # Question: do we avoid selecting src_nodes that can't send money or count that as failure?
+    # Question: Is this threaded?
+
+    selected = select_payment_nodes(consumers, merchants, total_freqs)
+    amnt = select_pay_amnt(G, selected[0])
+
+    selected[0].make_payment(G, selected[1], amnt)
 
     # nx.draw(G)
     # plt.show()
