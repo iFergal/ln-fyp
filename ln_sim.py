@@ -1,6 +1,7 @@
 import networkx as nx
 import numpy as np
 from networkx.algorithms.shortest_paths.generic import all_shortest_paths
+from networkx.algorithms.simple_paths import _bidirectional_dijkstra, PathBuffer
 from networkx.generators.random_graphs import _random_subset
 import matplotlib.pyplot as plt
 from math import inf, floor
@@ -25,6 +26,7 @@ AMP_TIMEOUT = 60  # 60 seconds in c-lightning
 DEBUG = True
 MERCHANT_PROB = 0.67
 LATENCY_DISTRIBUTION = [0.925, 0.049, 0.026]  # For [100ms, 1s, 10s] - Sprites paper
+MAX_PATH_ATTEMPTS = 10  # For AMP, if we try a subpayment on this many paths and fail, stop.
 
 # Consumers pay merchants - this is the chance for different role,
 # i.e. merchant to pay or consumer to receive, [0, 0.5] - 0.5 means both as likely as each other
@@ -68,6 +70,72 @@ class Node:
 
     def get_receive_freq(self):
         return self._receive_freq
+
+    def _find_path(self, G, dest, amnt):
+        """Attempt to find a path from self to dest within graph G.
+
+        Adapted from NetworkX shorest_simple_paths src code.
+
+        Args:
+            G: NetworkX graph in use.
+            dest: (Node) destination node to attempt to find best path to.
+            amnt: (float) number of satoshi the resultant path must support.
+
+        Returns:
+            a generator that produces a list of possible paths, from best to worst.
+
+        Raises:
+            NetworkXError: if self or dest are not in the input graph.
+            NetworkXNoPath: if no path exists from src to dest.
+        """
+        if self not in G:
+            raise nx.NodeNotFound("Src [%s] not in graph" % self)
+
+        if dest not in G:
+            raise nx.NodeNotFound("Dest [%s] not in graph" % dest)
+
+        # Path find based on lowest fees for now
+        weight = lambda u, v, d: d["fees"][0] + d["fees"][1] * amnt
+
+        def length_func(path):
+            return sum(G.adj[u][v]["fees"][0] + G.adj[u][v]["fees"][1] * amnt for (u, v) in zip(path, path[1:]))
+
+        shortest_path_func = _bidirectional_dijkstra
+
+        listA = list()
+        listB = PathBuffer()
+        prev_path = None
+        while len(listA) < MAX_PATH_ATTEMPTS:
+            if not prev_path:
+                length, path = shortest_path_func(G, self, dest, weight=weight)
+                listB.push(length, path)
+            else:
+                ignore_nodes = set()
+                ignore_edges = set()
+                for i in range(1, len(prev_path)):
+                    root = prev_path[:i]
+                    root_length = length_func(root)
+                    for path in listA:
+                        if path[:i] == root:
+                            ignore_edges.add((path[i - 1], path[i]))
+                    try:
+                        length, spur = shortest_path_func(G, root[-1], dest,
+                                                          ignore_nodes=ignore_nodes,
+                                                          ignore_edges=ignore_edges,
+                                                          weight=weight)
+                        path = root[:-1] + spur
+                        listB.push(root_length + length, path)
+                    except nx.NetworkXNoPath:
+                        pass
+                    ignore_nodes.add(root[-1])
+
+            if listB:
+                path = listB.pop()
+                yield path
+                listA.append(path)
+                prev_path = path
+            else:
+                break
 
     def update_chan(self, G, dest, amnt, htlc=False, test_payment=False, debug=DEBUG):
         """Update a channel's balance by making a payment from src (self) to dest.
@@ -127,9 +195,12 @@ class Node:
 
         # Finds shortest path based on lowest fees, for now.
         if self in searchable and dest in searchable:
-            paths = [p for p in all_shortest_paths(searchable, self, dest, \
-                        weight=lambda u, v, d: d["fees"][0] + d["fees"][1] * amnt) \
-                        if p not in failed_routes]
+            # paths = [p for p in all_shortest_paths(searchable, self, dest, \
+                        # weight=lambda u, v, d: d["fees"][0] + d["fees"][1] * amnt) \
+                        # if p not in failed_routes]
+            paths = [p for p in self._find_path(searchable, dest, 0) if p not in failed_routes]
+
+            print(len(paths))
 
             if len(paths) == 0:
                 if debug: print("Error: no remaining possible routes [%d]." % subpayment)
@@ -560,7 +631,7 @@ def simulator():
     selected = select_payment_nodes(consumers, merchants, total_freqs)
     amnt = select_pay_amnt(G, selected[0])
 
-    selected[0].make_payment(G, selected[1], amnt)
+    selected[0].make_payment(G, selected[1], amnt, 3)
 
     # nx.draw(G)
     # plt.show()
@@ -731,7 +802,7 @@ def test_func():
     assert G[nodes[19]][nodes[14]]["equity"] == e_19_14 - amnts_2[1]
     assert G[nodes[14]][nodes[19]]["equity"] == e_14_19 + amnts_2[1]
 
-if __name__ == "__main__":
-    test_func()
+# if __name__ == "__main__":
+    # test_func()
 
 simulator()
