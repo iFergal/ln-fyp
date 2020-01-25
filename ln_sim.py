@@ -154,13 +154,14 @@ class Node:
         if debug: print("%s is receiving packet from node communicator." % self)
         self._queue.put(packet)
 
-    def process_next_packet(self, G, node_comm, debug=DEBUG):
+    def process_next_packet(self, G, node_comm, test_mode=False, debug=DEBUG):
         """Process next packet if any.
 
         Args:
             G: NetworkX graph in use.
             debug: (boolean) True to display debug print statements.
             node_comm: (NodeCommunicator) main communicator to send packets to.
+            test_mode: (boolean) True if running from test function.
             debug: (boolean) True to display debug print statements.
 
         Returns:
@@ -170,6 +171,12 @@ class Node:
         # Need to only remove from the PriorityQueue if ready to be proccessed time-wise !
         try:
             p = self._queue.get(False)
+
+            if time.time() < p.get_timestamp():  # Not ready to be removed, return to queue
+                self._queue.put(p)
+                if debug: print("No packets are ready to process at %s yet." % self)
+                return False
+
             index = p.get_index(self._id)
             type = p.get_type()
             amnt = p.get_amnt(index - 1)
@@ -187,9 +194,9 @@ class Node:
                     G[src][self]["equity"] -= amnt
                     if type == "pay":
                         G[self][src]["equity"] += amnt
-                        if debug: print("Sent %.4f from %s to %s." % (amnt, src, self) + " [%d]" % subpayment[1] if subpayment else "")
+                        if debug: print("Sent %.4f from %s to %s." % (amnt, src, self) + (" [%d]" % subpayment[1] if subpayment else ""))
                     else:
-                        if debug: print("Sent (HTLC) %.4f from %s to %s." % (amnt, src, self) + " [%d]" % subpayment[1] if subpayment else "")
+                        if debug: print("Sent (HTLC) %.4f from %s to %s." % (amnt, src, self) + (" [%d]" % subpayment[1] if subpayment else ""))
                         if index == p.get_final_index():
                             # Receiver - so release preimage back and claim funds if not AMP
                             if not subpayment:
@@ -198,7 +205,7 @@ class Node:
                                 dest = p.get_node(index - 1)
                                 p.set_type("preimage")
 
-                                if debug: print("Received payment - sending preimage release message to node communicator from %s." % self)
+                                if debug: print("Received payment - sending preimage release message to node communicator from %s (-> %s)." % (self, dest))
                                 node_comm.send_packet(self, dest, p)
                             else:  # If AMP, we need to keep and store all the partial payments
                                 id, subp_index, _, ttl = p.get_subpayment()
@@ -217,7 +224,7 @@ class Node:
                                             G[self][dest]["equity"] += amnt
 
                                             s.set_type("preimage")
-                                            if debug: print("Sending preimage release message to node communicator from %s. [%d]" % (self, subpayment[1]))
+                                            if debug: print("Sending preimage release message to node communicator from %s (-> %s). [%d]" % (self, dest, subpayment[1]))
                                             node_comm.send_packet(self, dest, s)
                                         del self._amp_in[id]
                                 else:  # Out of time, need to release subpayments back
@@ -228,25 +235,25 @@ class Node:
                                         G[self][dest]["equity"] += amnt
 
                                         s.set_type("cancel")
-                                        if debug: print("Sending cancel message to node communicator from %s. [%d]" % (self, subpayment[1]))
+                                        if debug: print("Sending cancel message to node communicator from %s (-> %s). [%d]" % (self, dest, subpayment[1]))
                                         node_comm.send_packet(self, dest, s)
                         else:
                             # Need to keep sending it on, but only if funds are available
                             dest = p.get_node(index + 1)
                             amnt = p.get_amnt(index)
                             if G[self][dest]["equity"] >= amnt:
-                                if debug: print("Sending pay_htlc message to node communicator from %s." % self + " [%d]" % subpayment[1] if subpayment else "")
+                                if debug: print("Sending pay_htlc message to node communicator from %s (-> %s)." % (self, dest) + (" [%d]" % subpayment[1] if subpayment else ""))
                                 node_comm.send_packet(self, dest, p)
                             else:
-                                if debug: print("Error: equity between %s and %s not available for transfer - reversing." % (src, self) + " [%d]" % subpayment[1] if subpayment else "")
+                                if debug: print("Error: equity between %s and %s not available for transfer - reversing." % (src, self) + (" [%d]" % subpayment[1] if subpayment else ""))
                                 p.set_type("cancel")
                                 node_comm.send_packet(self, p.get_node(index - 1), p)
                 else:
-                    if debug: print("Error: equity between %s and %s not available for transfer." % (src, self) + " [%d]" % subpayment[1] if subpayment else "")
+                    if debug: print("Error: equity between %s and %s not available for transfer." % (src, self) + (" [%d]" % subpayment[1] if subpayment else ""))
 
                     dest = p.get_node(index - 1)  # Propagate back CANCEL
                     p.set_type("cancel_rest")  # Not regular cancel as no HTLC with prev. node.
-                    if debug: print("Sending cancellation message to node communicator from %s." % self + " [%d]" % subpayment[1] if subpayment else "")
+                    if debug: print("Sending cancellation message to node communicator from %s (-> %s)." % (self, dest) + (" [%d]" % subpayment[1] if subpayment else ""))
                     node_comm.send_packet(self, dest, p)
             elif type == "preimage":
                 if index != 0:  # Keep releasing
@@ -254,13 +261,13 @@ class Node:
                     G[self][dest]["equity"] += amnt
 
                     if debug:
-                        print("%s claimed back %.4f from payment to %s." % (self, amnt, dest) + " [%d]" % subpayment[1] if subpayment else "")
-                        print("Sending preimage release message to node communicator from %s." % self + " [%d]" % subpayment[1] if subpayment else "")
+                        print("%s claimed back %.4f from payment to %s." % (self, amnt, dest) + (" [%d]" % subpayment[1] if subpayment else ""))
+                        print("Sending preimage release message to node communicator from %s (-> %s)." % (self, dest) + (" [%d]" % subpayment[1] if subpayment else ""))
                     node_comm.send_packet(self, dest, p)
                 else:  # Sender, receipt come back
                     if debug:
                         j = p.get_final_index()
-                        print("Payment [%s -> %s // %.4f] successly completed." % (self, p.get_node(j), p.get_amnt(j-1)) + " [%d]" % subpayment[1] if subpayment else "")
+                        print("Payment [%s -> %s // %.4f] successly completed." % (self, p.get_node(j), p.get_amnt(j-1)) + (" [%d]" % subpayment[1] if subpayment else ""))
 
                     if p.get_subpayment() and p.get_subpayment()[0] in self._amp_out:
                         # Then, receiver must have got all of AMP
@@ -273,34 +280,39 @@ class Node:
 
                 if p.get_type() == "cancel":  # Not cancel_rest
                     G[self][dest]["equity"] += amnt  # Claim back
-                    if debug: print("%s cancelled HTLC and claimed back %.4f from payment to %s." % (self, amnt, dest) + " [%d]" % subpayment[1] if subpayment else "")
+                    if debug: print("%s cancelled HTLC and claimed back %.4f from payment to %s." % (self, amnt, dest) + (" [%d]" % subpayment[1] if subpayment else ""))
                 else:
                     p.set_type("cancel")
 
                 if index == 0 and debug:
                     j = p.get_final_index()
-                    print("Payment [%s -> %s // %.4f] failed and returned." % (self, p.get_node(j), p.get_amnt(j-1)) + " [%d]" % subpayment[1] if subpayment else "")
+                    print("Payment [%s -> %s // %.4f] failed and returned." % (self, p.get_node(j), p.get_amnt(j-1)) + (" [%d]" % subpayment[1] if subpayment else ""))
 
                 if index != 0:  # Send cancel message on
                     dest = p.get_node(index - 1)
-                    if debug: print("Sending cancellation message to node communicator from %s." % self + " [%d]" % subpayment[1] if subpayment else "")
+                    if debug: print("Sending cancellation message to node communicator from %s (-> %s)." % (self, dest) + (" [%d]" % subpayment[1] if subpayment else ""))
                     node_comm.send_packet(self, dest, p)
-                elif p.get_subpayment():  # Partial payment of AMP failed
-                    subp = p.get_subpayment()  # [ID, index, total num, ttl]
-                    ttl = subp[3]
+                elif subpayment:  # Partial payment of AMP failed
+                    # subpayment in form [ID, index, total num, ttl]
+                    id, i, k, ttl = subpayment
 
-                    if time.time() < ttl:
+                    if time.time() < ttl and self._amp_out[id][2]:
                         # Still within time limit - so try again!
                         # In Rusty Russell podcast - c-lightning is 60 seconds.
                         j = p.get_final_index()
-                        self._amp_out[subp[0]][0][subp[1]] += [p.get_path()]
-                        new_subp = (subp[0], subp[1], subp[2])
+                        self._amp_out[id][0][i] += [p.get_path()]
+                        new_subp = (id, i, k)
 
-                        if debug: print("Resending... [%d]" % subpayment[1])
-                        new_attempt = self._init_payment(G, p.get_node(j), p.get_amnt(j-1), node_comm, new_subp, debug=debug)
+                        if debug: print("Resending... [%d]" % i)
+                        new_attempt = self._init_payment(G, p.get_node(j), p.get_amnt(j-1), node_comm, new_subp, test_mode=test_mode, debug=debug)
                         if debug and not new_attempt:
+                            self._amp_out[id][2] = False
                             j = p.get_final_index()
                             print("AMP from %s to %s [%.4s] failed." % (self, p.get_node(j), p.get_amnt(j-1)))
+                    else:
+                        if debug:
+                            j = p.get_final_index()
+                            print("Partial payment [%d] of failed AMP from %s to %s [%.4s] returned - not resending." % (i, self, p.get_node(j), p.get_amnt(j-1)))
             return True
         except Empty:
             if debug: print("No packets to process at %s." % self)
@@ -324,14 +336,14 @@ class Node:
                 amnt = p.get_amnt(index - 1)
 
                 p.set_type("cancel")
-                if debug: print("Sending cancel message to node communicator from %s." % (self))
+                if debug: print("Sending cancel message to node communicator from %s (-> %s)." % (self, dest))
                 node_comm.send_packet(self, dest, p)
             to_delete += [id]
 
         for id in to_delete:
             del self._amp_in[id]
 
-    def _find_path(self, G, dest, amnt):
+    def _find_path(self, G, dest, amnt, k=MAX_PATH_ATTEMPTS):
         """Attempt to find a path from self to dest within graph G.
 
         Adapted from NetworkX shorest_simple_paths src code.
@@ -340,6 +352,7 @@ class Node:
             G: NetworkX graph in use.
             dest: (Node) destination node to attempt to find best path to.
             amnt: (float) number of satoshi the resultant path must support.
+            k: (int) maximum number of paths to return.
 
         Returns:
             a generator that produces a list of possible paths, from best to worst.
@@ -365,7 +378,7 @@ class Node:
         listA = list()
         listB = PathBuffer()
         prev_path = None
-        while len(listA) < MAX_PATH_ATTEMPTS:
+        while len(listA) < k:
             if not prev_path:
                 length, path = shortest_path_func(G, self, dest, weight=weight)
                 listB.push(length, path)
@@ -397,7 +410,7 @@ class Node:
             else:
                 break
 
-    def _init_payment(self, G, dest, amnt, node_comm, subpayment=False, debug=DEBUG):
+    def _init_payment(self, G, dest, amnt, node_comm, subpayment=False, test_mode=False, debug=DEBUG):
         """Initialise a regular single payment from this node to destination node of amnt.
 
         Args:
@@ -408,28 +421,32 @@ class Node:
             subpayment: (boolean / (UUID, int, int))
                 - (ID of subpayment group, index of subpayment, total num subpayments),
                 - or False if not AMP.
+            test_mode: (boolean) True if running from test function.
             debug: (boolean) True to display debug print statements.
 
         Returns:
             True if payment packet sent out successfully,
             False otherwise.
         """
-        # Reduce graph to edges with enough equity - this is very costly - fix.
+        # Reduce graph to edges with enough equity.
+        # @TODO: This is costly - need to rewrite dijstra in find_path to only follow paths given constaints.
         searchable = nx.DiGraph(((src, tar, attr) for src, tar, attr in G.edges(data=True) \
                                 if G[src][tar]["equity"] + G[tar][src]["equity"] >= amnt))
 
         # Finds shortest path based on lowest fees, for now.
         if self in searchable and dest in searchable:
             failed_routes = []
+
             if subpayment:
                 failed_routes = self._amp_out[subpayment[0]][0][subpayment[1]]
+                # print(failed_routes)
 
-            paths = [p for p in all_shortest_paths(searchable, self, dest, \
-                        weight=lambda u, v, d: d["fees"][0] + d["fees"][1] * amnt) \
-                        if p not in failed_routes]
-
-            # Breaks tests - @TODO: fix
-            # paths = [p for p in self._find_path(searchable, dest, 0) if p not in failed_routes]
+            if test_mode:
+                paths = [p for p in all_shortest_paths(searchable, self, dest, \
+                            weight=lambda u, v, d: d["fees"][0] + d["fees"][1] * amnt) \
+                            if p not in failed_routes]
+            else:
+                paths = [p for p in self._find_path(searchable, dest, 0) if p not in failed_routes]
 
             if len(paths) == 0:
                 if debug: print("Error: no remaining possible routes [%d]." % subpayment[1])
@@ -451,15 +468,15 @@ class Node:
             p = Packet(path, index_mapping, send_amnts, type,
                 (subpayment[0], subpayment[1], subpayment[2], ttl) if subpayment else False)
 
-            if debug: print("Sending %s message to node communicator from %s." % (type, self) + " [%d]" % subpayment[1] if subpayment else "")
+            if debug: print("Sending %s message to node communicator from %s (-> %s)." % (type, self, path[1]) + (" [%d]" % subpayment[1] if subpayment else ""))
             node_comm.send_packet(self, path[1], p)
 
             return True
         else:
-            if debug: print("Error: No route available." + " [%d]" % subpayment[1] if subpayment else "")
+            if debug: print("Error: No route available." + (" [%d]" % subpayment[1] if subpayment else ""))
             return False
 
-    def init_payment(self, G, dest, amnt, node_comm, k=1, debug=DEBUG):
+    def init_payment(self, G, dest, amnt, node_comm, k=1, test_mode=False, debug=DEBUG):
         """Initialse a payment from this node to destination node of amnt.
 
         May be split by into k different packets [ AMP ].
@@ -470,10 +487,11 @@ class Node:
             amnt: (float) number of satoshi to send.
             node_comm: (NodeCommunicator) main communicator to send packets to.
             k: (int) AMP if >1 - number of ways to split payment. (1 by default)
+            test_mode: (boolean) True if running from test function.
             debug: (boolean) True to display debug print statements.
         """
         if k == 1:
-            self._init_payment(G, dest, amnt, node_comm, False, test_payment, debug=debug)
+            self._init_payment(G, dest, amnt, node_comm, False, test_mode=test_mode, debug=debug)
         else:  # AMP
             amnts = [floor(amnt / k) for _ in range(k-1)]
             last = amnt - sum(amnts)
@@ -486,11 +504,11 @@ class Node:
             # After timeout, attempt at AMP cancelled
             ttl = time.time() + AMP_TIMEOUT
 
-            self._amp_out[id] = [subp_statuses, ttl, k]
+            self._amp_out[id] = [subp_statuses, ttl, True]  # True here means hasn't failed yet
 
             # Send off each subpayment - first attempt.
             for i in range(len(amnts)):
-                self._init_payment(G, dest, amnts[i], node_comm, (id, i, k), debug=debug)
+                self._init_payment(G, dest, amnts[i], node_comm, (id, i, k), test_mode=test_mode, debug=debug)
 
     def get_total_equity(self, G):
         """Returns the total equity held by a node (not locked up in HTLCs). """
@@ -518,7 +536,7 @@ class Node:
 
 
 class NodeCommunicator:
-    """Handles communication between nodes.
+    """Handles communication between nodes and records statistics.
 
     Messages are synced to UTC time and network latency is applied by using future timestamps.
 
@@ -527,9 +545,10 @@ class NodeCommunicator:
     Attributes:
         nodes: (list<Node>) set of nodes to handle communication between.
         edge_pairs: (set<tuple<networkX.Graph.Edge>>) payment channels: corresponding edges grouped.
+        test_mode: (boolean) True if testing - remove randomised latencies.
         debug: (boolean) True to display debug print statements.
     """
-    def __init__(self, nodes, edge_pairs, debug=DEBUG):
+    def __init__(self, nodes, edge_pairs, test_mode=False, debug=DEBUG):
         self._nodes = nodes
         self._edge_pairs = edge_pairs
         self._debug = debug
@@ -539,17 +558,24 @@ class NodeCommunicator:
             latency = np.random.choice(LATENCY_OPTIONS, 1, p=LATENCY_DISTRIBUTION)
 
             # Both directions for ease of access in send_packet
-            self._latencies[edge_pair] = latency[0]
-            self._latencies[edge_pair[::-1]] = latency[0]
+            self._latencies[edge_pair] = latency[0] if not test_mode else 0
+            self._latencies[edge_pair[::-1]] = latency[0] if not test_mode else 0
+
+    def set_latency(self, a, b, latency):
+        """Update the latency between two nodes. (assumes edge exists) """
+        self._latencies[(a, b)] = latency
+        self._latencies[(b, a)] = latency
 
     def send_packet(self, src, dest, packet):
         """Processes and sends a packet from src to dest. """
         if self._debug: print("[NODE-COMM] Relaying message between %s and %s." % (src, dest))
 
-        # arrival_time = time.time() + self._latencies[src][dest]
-        packet.set_timestamp(0.1)
-
+        packet.set_timestamp(time.time() + self._latencies[(src, dest)])
         dest.receive_packet(packet, self._debug)
+
+    def record_stat(self):
+        """Placeholder method for recording stats - nodes can send when fail / success etc. """
+        pass
 
 
 def floor_msat(satoshi):
@@ -808,6 +834,8 @@ def simulator():
     # G, pairs = generate_barabasi_albert(NUM_NODES, floor(NUM_NODES / 4))
     nodes = list(G)
 
+    node_comm = NodeCommunicator(nodes, pairs)
+
     consumers = []
     merchants = []
     total_freqs = [0, 0, 0, 0] # s_c, s_m, r_c, r_m
@@ -826,12 +854,11 @@ def simulator():
     # Need to decide how many satoshi per payment (based on available balance etc?)
     # Need to decide how to split up payments - trial & error.
     # Question: do we avoid selecting src_nodes that can't send money or count that as failure?
-    # Question: Is this threaded?
 
     selected = select_payment_nodes(consumers, merchants, total_freqs)
     amnt = select_pay_amnt(G, selected[0])
 
-    selected[0].make_payment(G, selected[1], amnt, 3)
+    selected[0].init_payment(G, selected[1], amnt, node_comm, 3)
 
     # nx.draw(G)
     # plt.show()
@@ -852,7 +879,7 @@ def test_func():
     G, pairs = generate_wattz_strogatz(NUM_TEST_NODES, 6, 0.3, 10, True)
     nodes = list(G)
 
-    node_comm = NodeCommunicator(nodes, pairs, debug=TEST_DEBUG)
+    node_comm = NodeCommunicator(nodes, pairs, test_mode=True, debug=TEST_DEBUG)
 
     # Payment from 0 to 14 will find path 0-1-14
     path = [nodes[0], nodes[1], nodes[14]]
@@ -913,6 +940,9 @@ def test_func():
     G, pairs = generate_wattz_strogatz(NUM_TEST_NODES, 6, 0.3, 10, True)
     nodes = list(G)
 
+    # Need to re-init for new node/edge references
+    node_comm = NodeCommunicator(nodes, pairs, test_mode=True, debug=TEST_DEBUG)
+
     if TEST_DEBUG: print("\n// AMP SUCCESS - NO FAILED ROUTES\n-------------------------")
 
     # From above, we've already tested that single payments work and if they fail revert correctly
@@ -950,13 +980,13 @@ def test_func():
     assert G[nodes[1]][nodes[0]]["equity"] == e_1_0 + amnts[0] * 2 + amnts_2[0]
     assert G[nodes[1]][nodes[14]]["equity"] == e_1_14 - amnts[1] * 2 - amnts_2[1]
     assert G[nodes[14]][nodes[1]]["equity"] == e_14_1 + amnts[1] * 2 + amnts_2[1]
-
+    TEST_DEBUG=True
     if TEST_DEBUG: print("\n// AMP SUCCESS - FAILS WITH NO MORE ROUTES\n-------------------------")
 
     # Try same payment again - will work for subpayments but last payment will fail.
     # First 2 subpayments reverted - so should be same as above.
     # Stops when all routes exhausted - will also stop if taking too long - no need to test this.
-    nodes[0].init_payment(G, nodes[14], 10, node_comm, k=3, debug=TEST_DEBUG)
+    nodes[0].init_payment(G, nodes[14], 10, node_comm, k=3, test_mode=True, debug=TEST_DEBUG)
     nodes[1].process_next_packet(G, node_comm, debug=TEST_DEBUG)
     nodes[0].process_next_packet(G, node_comm, debug=TEST_DEBUG)
     nodes[1].process_next_packet(G, node_comm, debug=TEST_DEBUG)
@@ -975,7 +1005,7 @@ def test_func():
     nodes[19].process_next_packet(G, node_comm, debug=TEST_DEBUG)
     nodes[14].process_next_packet(G, node_comm, debug=TEST_DEBUG)
     nodes[19].process_next_packet(G, node_comm, debug=TEST_DEBUG)
-    nodes[0].process_next_packet(G, node_comm, debug=TEST_DEBUG)
+    nodes[0].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
 
     # 0-19-14 will right now have 2 partial payments locked up in HTLC
     assert G[nodes[0]][nodes[19]]["equity"] == e_0_19 - amnts[0] * 2
@@ -1001,13 +1031,16 @@ def test_func():
     assert G[nodes[1]][nodes[0]]["equity"] == e_1_0 + amnts[0] * 2 + amnts_2[0]
     assert G[nodes[1]][nodes[14]]["equity"] == e_1_14 - amnts[1] * 2 - amnts_2[1]
     assert G[nodes[14]][nodes[1]]["equity"] == e_14_1 + amnts[1] * 2 + amnts_2[1]
-
+    TEST_DEBUG=False
     if TEST_DEBUG: print("\n// AMP SUCCESS - SUCCESS WITH FAILED ROUTES\n-------------------------")
 
     # Try a payment that has failed routes, but finds enough other routes to
     # successfully route the payment - reset so we can use same route.
     G, pairs = generate_wattz_strogatz(NUM_TEST_NODES, 6, 0.3, 10, True)
     nodes = list(G)
+
+    # Need to re-init for new node/edge references
+    node_comm = NodeCommunicator(nodes, pairs, test_mode=True, debug=TEST_DEBUG)
 
     # Sent as 5/5/5 - alternative route 0-19-14 for last payment.
     path = [nodes[0], nodes[1], nodes[14]]
@@ -1054,6 +1087,34 @@ def test_func():
     assert G[nodes[19]][nodes[0]]["equity"] == e_19_0 + amnts_2[0]
     assert G[nodes[19]][nodes[14]]["equity"] == e_19_14 - amnts_2[1]
     assert G[nodes[14]][nodes[19]]["equity"] == e_14_19 + amnts_2[1]
+
+    if TEST_DEBUG: print("\n// PACKET ARRIVAL TIME PROCESSING - FUTURE PACKETS\n-------------------------")
+
+    G, pairs = generate_wattz_strogatz(NUM_TEST_NODES, 6, 0.3, 10, True)
+    nodes = list(G)
+
+    # Need to re-init for new node/edge references
+    node_comm = NodeCommunicator(nodes, pairs, test_mode=True, debug=TEST_DEBUG)
+
+    e_0_1 = G[nodes[0]][nodes[1]]["equity"]
+    e_1_0 = G[nodes[1]][nodes[0]]["equity"]
+
+    node_comm.set_latency(nodes[0], nodes[1], 10)
+    nodes[0]._init_payment(G, nodes[1], 5, node_comm, debug=TEST_DEBUG)
+    nodes[1].process_next_packet(G, node_comm, debug=TEST_DEBUG)
+
+    # Should be no change as packet hasn't "reached" 1 yet.
+    assert G[nodes[0]][nodes[1]]["equity"] == e_0_1
+    assert G[nodes[1]][nodes[0]]["equity"] == e_1_0
+
+    # Try again with no latency, new payment, old still won't have made it
+    node_comm.set_latency(nodes[0], nodes[1], 0)
+    nodes[0]._init_payment(G, nodes[1], 5, node_comm, debug=TEST_DEBUG)
+    nodes[1].process_next_packet(G, node_comm, debug=TEST_DEBUG)
+
+    # Should be no change as packet hasn't "reached" 1 yet.
+    assert G[nodes[0]][nodes[1]]["equity"] == e_0_1 - 5
+    assert G[nodes[1]][nodes[0]]["equity"] == e_1_0 + 5
 
 if __name__ == "__main__":
     test_func()
