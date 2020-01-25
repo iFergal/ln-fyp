@@ -27,9 +27,14 @@ MAX_HOPS = 20  # LN standard
 AMP_TIMEOUT = 60  # 60 seconds in c-lightning
 DEBUG = True
 MERCHANT_PROB = 0.67
-LATENCY_OPTIONS = [0.1, 1, 10]  # Sprites paper
+LATENCY_OPTIONS = [0.1, 1, 10]  # Sprites paper, in seconds
 LATENCY_DISTRIBUTION = [0.925, 0.049, 0.026]
-MAX_PATH_ATTEMPTS = 10  # For AMP, if we try a subpayment on this many paths and fail, stop.
+CTLV_OPTIONS = [9]  # Default on LN for now
+CTLV_DISTRIBUTION = [1]
+CLTV_MULTIPLIER = 600  # BTC block time is ~10 minutes, so 600 seconds
+DELAY_RESP_VAL = [0, 0.2, 0.4, 0.6, 0.8, 1]  # Amount of timelock time node will wait before cancelling/claiming
+DELAY_RESP_DISTRIBUTION = [0.9, 0.05, 0.01, 0.005, 0.005, 0.03]
+MAX_PATH_ATTEMPTS = 10  # For AMP, if we try a subpayment on this many paths and fail, stop
 
 # Consumers pay merchants - this is the chance for different role,
 # i.e. merchant to pay or consumer to receive, [0, 0.5] - 0.5 means both as likely as each other
@@ -59,16 +64,15 @@ class Packet:
         subpayment: (boolean / (UUID, int, int, float))
                 - (ID of containing AMP, index of subpayment, total num subpayments, timeout time),
                 - or False if not part of AMP.
-        htlc_ids: (list<int>) list of HTLC IDs used as payment propagates towards receiver.
     """
 
-    def __init__(self, path, index_mapping, send_amnts, type="pay_htlc", subpayment=False, htlc_ids=[]):
+    def __init__(self, path, index_mapping, send_amnts, type="pay_htlc", subpayment=False):
         self._path = path
         self._index_mapping = index_mapping
         self._type = type
         self._send_amnts = send_amnts
         self._subpayment = subpayment
-        self._htlc_ids = htlc_ids
+        self._htlc_ids = []
         self._timestamp = None
         self._final_index = len(path) - 1
 
@@ -93,9 +97,6 @@ class Packet:
     def get_subpayment(self):
         return self._subpayment
 
-    def get_htlc_id(self, index):
-        return self._htlc_ids[index]
-
     def get_timestamp(self):
         return self._timestamp
 
@@ -104,6 +105,12 @@ class Packet:
 
     def get_final_index(self):
         return self._final_index
+
+    def add_htlc_id(self, id):
+        self._htlc_ids.append(id)
+
+    def get_htlc_id(self, index):
+        return self._htlc_ids[index]
 
     def __lt__(self, other):
         return self.get_timestamp() < other.get_timestamp()
@@ -126,8 +133,8 @@ class Node:
         self._receive_freq = receive_freq
         self._amp_out = {}
         self._amp_in = {}
+        self._htlc_out = {}  # Maps other nodes to HTLCs
         self._queue = PriorityQueue()
-        self._htlc_min_id = 0
 
     def get_id(self):
         return self._id
@@ -140,6 +147,20 @@ class Node:
 
     def get_receive_freq(self):
         return self._receive_freq
+
+    def update_htlc_out(self, node, id, amnt, ttl):
+        """Neighbouring nodes can add new HTLC info when established on their channel.
+
+        Args:
+            node: (Node) the node at the other end of the channel.
+            id: (UUID) ID of HTLC between nodes.
+            amnt: (float) number of satoshi contained in the HTLC.
+            ttl: (float) real UTC time when the HTLC will be available to claim by self.
+        """
+        if not node in self._htlc_out:
+            self._htlc_out[node] = {}
+
+        self._htlc_out[node][id] = (amnt, ttl)
 
     def get_queue(self):
         return self._queue
@@ -163,10 +184,6 @@ class Node:
             node_comm: (NodeCommunicator) main communicator to send packets to.
             test_mode: (boolean) True if running from test function.
             debug: (boolean) True to display debug print statements.
-
-        Returns:
-            True if a packet was successfully proccessed,
-            False otherwise, or no packet was available.
         """
         # Need to only remove from the PriorityQueue if ready to be proccessed time-wise !
         try:
@@ -175,7 +192,7 @@ class Node:
             if time.time() < p.get_timestamp():  # Not ready to be removed, return to queue
                 self._queue.put(p)
                 if debug: print("No packets are ready to process at %s yet." % self)
-                return False
+                return
 
             index = p.get_index(self._id)
             type = p.get_type()
@@ -191,11 +208,17 @@ class Node:
                 src = p.get_node(index - 1)
                 # Assume: amnt > 0, check for available funds only
                 if G[src][self]["equity"] >= amnt:
-                    G[src][self]["equity"] -= amnt
+                    G[src][self]["equity"] -= amnt  # To HTLC
                     if type == "pay":
                         G[self][src]["equity"] += amnt
                         if debug: print("Sent %.4f from %s to %s." % (amnt, src, self) + (" [%d]" % subpayment[1] if subpayment else ""))
                     else:
+                        id = uuid4()
+                        ttl = time.time() + node_comm.get_ctlv_delta(src, self) * CLTV_MULTIPLIER
+                        src.update_htlc_out(self, id, amnt, ttl)
+
+                        p.add_htlc_id(id)
+
                         if debug: print("Sent (HTLC) %.4f from %s to %s." % (amnt, src, self) + (" [%d]" % subpayment[1] if subpayment else ""))
                         if index == p.get_final_index():
                             # Receiver - so release preimage back and claim funds if not AMP
@@ -213,7 +236,7 @@ class Node:
                                     self._amp_in[id] = []
 
                                 if time.time() <= ttl:  # Within time
-                                    self._amp_in[id] += [p]
+                                    self._amp_in[id].append(p)
                                     if debug: print("Received partial payment at %s. [%d]" % (self, subpayment[1]))
 
                                     if len(self._amp_in[id]) == subpayment[2]:  # All collected, release HTLCs
@@ -256,6 +279,9 @@ class Node:
                     if debug: print("Sending cancellation message to node communicator from %s (-> %s)." % (self, dest) + (" [%d]" % subpayment[1] if subpayment else ""))
                     node_comm.send_packet(self, dest, p)
             elif type == "preimage":
+                # Release HTLC entry
+                del self._htlc_out[p.get_node(index + 1)][p.get_htlc_id(index)]
+
                 if index != 0:  # Keep releasing
                     dest = p.get_node(index - 1)
                     G[self][dest]["equity"] += amnt
@@ -278,7 +304,21 @@ class Node:
                 dest = p.get_node(index + 1)
                 amnt = p.get_amnt(index)
 
+                cancel_chance = np.random.choice(DELAY_RESP_VAL, 1, p=DELAY_RESP_DISTRIBUTION)[0] if not test_mode else 0
+
+                # Some unresponsive or malicious nodes might delay the cancellation
+                if cancel_chance:
+                    # Simulate this by requeuing the Packet with an updated timestamp to open
+                    ttl = time.time() + node_comm.get_ctlv_delta(self, dest) * CLTV_MULTIPLIER * cancel_chance
+                    p.set_timestamp(ttl)
+                    self._queue.put(p)
+                    
+                    if debug: print("%s is waiting for %f of HTLC timeout before signing..." % (self, cancel_chance))
+                    return
+
                 if p.get_type() == "cancel":  # Not cancel_rest
+                    del self._htlc_out[dest][p.get_htlc_id(index)]
+
                     G[self][dest]["equity"] += amnt  # Claim back
                     if debug: print("%s cancelled HTLC and claimed back %.4f from payment to %s." % (self, amnt, dest) + (" [%d]" % subpayment[1] if subpayment else ""))
                 else:
@@ -300,7 +340,7 @@ class Node:
                         # Still within time limit - so try again!
                         # In Rusty Russell podcast - c-lightning is 60 seconds.
                         j = p.get_final_index()
-                        self._amp_out[id][0][i] += [p.get_path()]
+                        self._amp_out[id][0][i].append(p.get_path())
                         new_subp = (id, i, k)
 
                         if debug: print("Resending... [%d]" % i)
@@ -313,10 +353,8 @@ class Node:
                         if debug:
                             j = p.get_final_index()
                             print("Partial payment [%d] of failed AMP from %s to %s [%.4s] returned - not resending." % (i, self, p.get_node(j), p.get_amnt(j-1)))
-            return True
         except Empty:
             if debug: print("No packets to process at %s." % self)
-            return False
 
     def clear_old_amps(self, G, node_comm, force=False, debug=DEBUG):
         """Check for timed out AMP payments with partial subpayments that need
@@ -338,7 +376,7 @@ class Node:
                 p.set_type("cancel")
                 if debug: print("Sending cancel message to node communicator from %s (-> %s)." % (self, dest))
                 node_comm.send_packet(self, dest, p)
-            to_delete += [id]
+            to_delete.append(id)
 
         for id in to_delete:
             del self._amp_in[id]
@@ -539,8 +577,8 @@ class NodeCommunicator:
     """Handles communication between nodes and records statistics.
 
     Messages are synced to UTC time and network latency is applied by using future timestamps.
-
     Edge latencies between nodes are initialsed here.
+    CTLV expiracy deltas (BOLT 7) per directed edge initialised here. (unit: number of BTC blocks)
 
     Attributes:
         nodes: (list<Node>) set of nodes to handle communication between.
@@ -553,18 +591,26 @@ class NodeCommunicator:
         self._edge_pairs = edge_pairs
         self._debug = debug
         self._latencies = {}
+        self._ctlv_deltas = {}
 
         for edge_pair in edge_pairs:
             latency = np.random.choice(LATENCY_OPTIONS, 1, p=LATENCY_DISTRIBUTION)
+            ctlv_expiracy_delta = np.random.choice(CTLV_OPTIONS, 1, p=CTLV_DISTRIBUTION)
 
             # Both directions for ease of access in send_packet
             self._latencies[edge_pair] = latency[0] if not test_mode else 0
             self._latencies[edge_pair[::-1]] = latency[0] if not test_mode else 0
 
+            self._ctlv_deltas[edge_pair] = ctlv_expiracy_delta[0]
+            self._ctlv_deltas[edge_pair[::-1]] = ctlv_expiracy_delta[0]
+
     def set_latency(self, a, b, latency):
         """Update the latency between two nodes. (assumes edge exists) """
         self._latencies[(a, b)] = latency
         self._latencies[(b, a)] = latency
+
+    def get_ctlv_delta(self, a, b):
+        return self._ctlv_deltas[(a, b)]
 
     def send_packet(self, src, dest, packet):
         """Processes and sends a packet from src to dest. """
@@ -892,10 +938,10 @@ def test_func():
 
     # Initialise by sending message from 0 to 1 and propagating out and in.
     nodes[0]._init_payment(G, nodes[14], 10, node_comm, debug=TEST_DEBUG)
-    nodes[1].process_next_packet(G, node_comm, debug=TEST_DEBUG)
-    nodes[14].process_next_packet(G, node_comm, debug=TEST_DEBUG)
-    nodes[1].process_next_packet(G, node_comm, debug=TEST_DEBUG)
-    nodes[0].process_next_packet(G, node_comm, debug=TEST_DEBUG)
+    nodes[1].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
+    nodes[14].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
+    nodes[1].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
+    nodes[0].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
 
     assert G[nodes[0]][nodes[1]]["equity"] == e_0_1 - amnts[0]
     assert G[nodes[1]][nodes[0]]["equity"] == e_1_0 + amnts[0]
@@ -907,8 +953,8 @@ def test_func():
     # There's no more equity from 1 to 14, so try this route again to test
     # for funds being released back correctly when a route fails mid-way forward.
     nodes[0]._init_payment(G, nodes[14], 5, node_comm, debug=TEST_DEBUG)
-    nodes[1].process_next_packet(G, node_comm, debug=TEST_DEBUG)
-    nodes[0].process_next_packet(G, node_comm, debug=TEST_DEBUG)
+    nodes[1].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
+    nodes[0].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
 
     # Should be the same as payment only made it one hop.
     assert G[nodes[0]][nodes[1]]["equity"] == e_0_1 - amnts[0]
@@ -930,7 +976,7 @@ def test_func():
     e_9_11 = G[nodes[9]][nodes[11]]["equity"]
 
     nodes[11]._init_payment(G, nodes[9], 5, node_comm, debug=TEST_DEBUG)
-    nodes[9].process_next_packet(G, node_comm, debug=TEST_DEBUG)
+    nodes[9].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
 
     assert G[nodes[11]][nodes[9]]["equity"] == e_11_9 - amnts[0]
     assert G[nodes[9]][nodes[11]]["equity"] == e_9_11 + amnts[0]
@@ -963,36 +1009,36 @@ def test_func():
     e_14_1 = G[nodes[14]][nodes[1]]["equity"]
 
     nodes[0].init_payment(G, nodes[14], 10, node_comm, k=3, debug=TEST_DEBUG)
-    nodes[1].process_next_packet(G, node_comm, debug=TEST_DEBUG)
-    nodes[14].process_next_packet(G, node_comm, debug=TEST_DEBUG)
-    nodes[1].process_next_packet(G, node_comm, debug=TEST_DEBUG)
-    nodes[14].process_next_packet(G, node_comm, debug=TEST_DEBUG)
-    nodes[1].process_next_packet(G, node_comm, debug=TEST_DEBUG)
-    nodes[14].process_next_packet(G, node_comm, debug=TEST_DEBUG)
-    nodes[1].process_next_packet(G, node_comm, debug=TEST_DEBUG)
-    nodes[0].process_next_packet(G, node_comm, debug=TEST_DEBUG)
-    nodes[1].process_next_packet(G, node_comm, debug=TEST_DEBUG)
-    nodes[0].process_next_packet(G, node_comm, debug=TEST_DEBUG)
-    nodes[1].process_next_packet(G, node_comm, debug=TEST_DEBUG)
-    nodes[0].process_next_packet(G, node_comm, debug=TEST_DEBUG)
+    nodes[1].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
+    nodes[14].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
+    nodes[1].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
+    nodes[14].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
+    nodes[1].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
+    nodes[14].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
+    nodes[1].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
+    nodes[0].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
+    nodes[1].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
+    nodes[0].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
+    nodes[1].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
+    nodes[0].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
 
     assert G[nodes[0]][nodes[1]]["equity"] == e_0_1 - amnts[0] * 2 - amnts_2[0]
     assert G[nodes[1]][nodes[0]]["equity"] == e_1_0 + amnts[0] * 2 + amnts_2[0]
     assert G[nodes[1]][nodes[14]]["equity"] == e_1_14 - amnts[1] * 2 - amnts_2[1]
     assert G[nodes[14]][nodes[1]]["equity"] == e_14_1 + amnts[1] * 2 + amnts_2[1]
-    TEST_DEBUG=True
+
     if TEST_DEBUG: print("\n// AMP SUCCESS - FAILS WITH NO MORE ROUTES\n-------------------------")
 
     # Try same payment again - will work for subpayments but last payment will fail.
     # First 2 subpayments reverted - so should be same as above.
     # Stops when all routes exhausted - will also stop if taking too long - no need to test this.
     nodes[0].init_payment(G, nodes[14], 10, node_comm, k=3, test_mode=True, debug=TEST_DEBUG)
-    nodes[1].process_next_packet(G, node_comm, debug=TEST_DEBUG)
-    nodes[0].process_next_packet(G, node_comm, debug=TEST_DEBUG)
-    nodes[1].process_next_packet(G, node_comm, debug=TEST_DEBUG)
-    nodes[0].process_next_packet(G, node_comm, debug=TEST_DEBUG)
-    nodes[1].process_next_packet(G, node_comm, debug=TEST_DEBUG)
-    nodes[0].process_next_packet(G, node_comm, debug=TEST_DEBUG) # All 3 will fail down first route
+    nodes[1].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
+    nodes[0].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
+    nodes[1].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
+    nodes[0].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
+    nodes[1].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
+    nodes[0].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG) # All 3 will fail down first route
 
     e_0_19 = G[nodes[0]][nodes[19]]["equity"]
     e_19_0 = G[nodes[19]][nodes[0]]["equity"]
@@ -1000,11 +1046,11 @@ def test_func():
     e_14_19 = G[nodes[14]][nodes[19]]["equity"]
 
     # New route 0-19-14
-    nodes[19].process_next_packet(G, node_comm, debug=TEST_DEBUG)
-    nodes[14].process_next_packet(G, node_comm, debug=TEST_DEBUG)
-    nodes[19].process_next_packet(G, node_comm, debug=TEST_DEBUG)
-    nodes[14].process_next_packet(G, node_comm, debug=TEST_DEBUG)
-    nodes[19].process_next_packet(G, node_comm, debug=TEST_DEBUG)
+    nodes[19].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
+    nodes[14].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
+    nodes[19].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
+    nodes[14].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
+    nodes[19].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
     nodes[0].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
 
     # 0-19-14 will right now have 2 partial payments locked up in HTLC
@@ -1015,10 +1061,10 @@ def test_func():
 
     # Release 2 subpayments that made the distance.
     nodes[14].clear_old_amps(G, node_comm, True, TEST_DEBUG)
-    nodes[19].process_next_packet(G, node_comm, debug=TEST_DEBUG)
-    nodes[0].process_next_packet(G, node_comm, debug=TEST_DEBUG)
-    nodes[19].process_next_packet(G, node_comm, debug=TEST_DEBUG)
-    nodes[0].process_next_packet(G, node_comm, debug=TEST_DEBUG)
+    nodes[19].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
+    nodes[0].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
+    nodes[19].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
+    nodes[0].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
 
     # Should be all returned
     assert G[nodes[0]][nodes[19]]["equity"] == e_0_19
@@ -1031,7 +1077,7 @@ def test_func():
     assert G[nodes[1]][nodes[0]]["equity"] == e_1_0 + amnts[0] * 2 + amnts_2[0]
     assert G[nodes[1]][nodes[14]]["equity"] == e_1_14 - amnts[1] * 2 - amnts_2[1]
     assert G[nodes[14]][nodes[1]]["equity"] == e_14_1 + amnts[1] * 2 + amnts_2[1]
-    TEST_DEBUG=False
+
     if TEST_DEBUG: print("\n// AMP SUCCESS - SUCCESS WITH FAILED ROUTES\n-------------------------")
 
     # Try a payment that has failed routes, but finds enough other routes to
@@ -1059,16 +1105,16 @@ def test_func():
     e_14_19 = G[nodes[14]][nodes[19]]["equity"]
 
     nodes[0].init_payment(G, nodes[14], 15, node_comm, k=3, debug=TEST_DEBUG)
-    nodes[1].process_next_packet(G, node_comm, debug=TEST_DEBUG)
-    nodes[14].process_next_packet(G, node_comm, debug=TEST_DEBUG)
-    nodes[1].process_next_packet(G, node_comm, debug=TEST_DEBUG)
-    nodes[14].process_next_packet(G, node_comm, debug=TEST_DEBUG)
-    nodes[1].process_next_packet(G, node_comm, debug=TEST_DEBUG)
-    nodes[0].process_next_packet(G, node_comm, debug=TEST_DEBUG)
+    nodes[1].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
+    nodes[14].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
+    nodes[1].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
+    nodes[14].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
+    nodes[1].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
+    nodes[0].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
 
     # New route 0-19-14
-    nodes[19].process_next_packet(G, node_comm, debug=TEST_DEBUG)
-    nodes[14].process_next_packet(G, node_comm, debug=TEST_DEBUG)
+    nodes[19].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
+    nodes[14].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
 
     # Knows base preimage, so HTLCs released back
     nodes[19].process_next_packet(G, node_comm, debug=TEST_DEBUG)
