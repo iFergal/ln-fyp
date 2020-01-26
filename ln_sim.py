@@ -2,6 +2,7 @@ import networkx as nx
 import numpy as np
 from networkx.algorithms.shortest_paths.generic import all_shortest_paths
 from networkx.algorithms.simple_paths import _bidirectional_dijkstra, PathBuffer
+from networkx.algorithms.shortest_paths.weighted import dijkstra_path
 from networkx.generators.random_graphs import _random_subset
 import matplotlib.pyplot as plt
 from math import inf, floor
@@ -75,6 +76,7 @@ class Packet:
         self._htlc_ids = []
         self._timestamp = None
         self._final_index = len(path) - 1
+        self._delayed = False
 
     def get_path(self):
         return self._path
@@ -90,6 +92,9 @@ class Packet:
 
     def set_type(self, type):
         self._type = type
+
+    def get_total_fees(self):
+        return sum([(self._send_amnts[i] - self._send_amnts[-1]) for i in range(len(self._send_amnts))])
 
     def get_amnt(self, index):
         return self._send_amnts[index]
@@ -112,6 +117,12 @@ class Packet:
     def get_htlc_id(self, index):
         return self._htlc_ids[index]
 
+    def is_delayed(self):
+        return self._delayed
+
+    def set_delayed(self):
+        self._delayed = True
+
     def __lt__(self, other):
         return self.get_timestamp() < other.get_timestamp()
 
@@ -131,10 +142,10 @@ class Node:
         self._merchant = merchant
         self._spend_freq = spend_freq
         self._receive_freq = receive_freq
-        self._amp_out = {}
-        self._amp_in = {}
+        self._amp_out = {}  # Outgoing AMPs still active
+        self._amp_in = {}  # Awaiting incoming AMPs
         self._htlc_out = {}  # Maps other nodes to HTLCs
-        self._queue = PriorityQueue()
+        self._queue = PriorityQueue()  # Packet queue
 
     def get_id(self):
         return self._id
@@ -304,17 +315,19 @@ class Node:
                 dest = p.get_node(index + 1)
                 amnt = p.get_amnt(index)
 
-                cancel_chance = np.random.choice(DELAY_RESP_VAL, 1, p=DELAY_RESP_DISTRIBUTION)[0] if not test_mode else 0
-
-                # Some unresponsive or malicious nodes might delay the cancellation
-                if cancel_chance:
-                    # Simulate this by requeuing the Packet with an updated timestamp to open
-                    ttl = time.time() + node_comm.get_ctlv_delta(self, dest) * CLTV_MULTIPLIER * cancel_chance
-                    p.set_timestamp(ttl)
-                    self._queue.put(p)
-                    
-                    if debug: print("%s is waiting for %f of HTLC timeout before signing..." % (self, cancel_chance))
-                    return
+                # if not p.is_delayed():
+                #     cancel_chance = np.random.choice(DELAY_RESP_VAL, 1, p=DELAY_RESP_DISTRIBUTION)[0] if not test_mode else 0
+                #
+                #     # Some unresponsive or malicious nodes might delay the cancellation
+                #     if cancel_chance:
+                #         # Simulate this by requeuing the Packet with an updated timestamp to open
+                #         ttl = time.time() + node_comm.get_ctlv_delta(self, dest) * CLTV_MULTIPLIER * cancel_chance
+                #         p.set_timestamp(ttl)
+                #         p.set_delayed()
+                #         self._queue.put(p)
+                #
+                #         if debug: print("%s is waiting for %.4f of HTLC timeout before signing..." % (self, cancel_chance))
+                #         return
 
                 if p.get_type() == "cancel":  # Not cancel_rest
                     del self._htlc_out[dest][p.get_htlc_id(index)]
@@ -340,7 +353,7 @@ class Node:
                         # Still within time limit - so try again!
                         # In Rusty Russell podcast - c-lightning is 60 seconds.
                         j = p.get_final_index()
-                        self._amp_out[id][0][i].append(p.get_path())
+                        self._amp_out[id][0][i].append((p.get_total_fees(), p.get_path()))
                         new_subp = (id, i, k)
 
                         if debug: print("Resending... [%d]" % i)
@@ -381,8 +394,35 @@ class Node:
         for id in to_delete:
             del self._amp_in[id]
 
-    def _find_path(self, G, dest, amnt, k=MAX_PATH_ATTEMPTS):
-        """Attempt to find a path from self to dest within graph G.
+    def send_direct(self, G, dest, amnt, node_comm, debug=DEBUG):
+        """Send funds over a direct payment channel to neighbouring node.
+
+        Args:
+            G: NetworkX graph in use.
+            dest: (Node) destination node to attempt to find best path to.
+            amnt: (float) number of satoshi the resultant path must support.
+            node_comm: (NodeCommunicator) main communicator to send packets to.
+            debug: (boolean) True to display debug print statements.
+
+        Returns:
+            True if payment packet sent out successfully,
+            False otherwise.
+        """
+        if G.has_edge(self, dest):
+            path = [self, dest]
+            index_mapping = {path[i].get_id(): i for i in range(len(path))}
+
+            p = Packet(path, index_mapping, [amnt], "pay", False)
+            node_comm.send_packet(self, dest, p)
+
+            if debug: print("Sending pay message to node communicator from %s (-> %s)." % (self, dest))
+            return True
+        else:
+            if debug: print("Error: no direct payment channel between %s and %s." % (self, dest))
+            return False
+
+    def _find_path(self, G, dest, amnt, failed_paths):
+        """Attempt to find the next shortest path from self to dest within graph G, that is not in failed_paths.
 
         Adapted from NetworkX shorest_simple_paths src code.
 
@@ -390,14 +430,14 @@ class Node:
             G: NetworkX graph in use.
             dest: (Node) destination node to attempt to find best path to.
             amnt: (float) number of satoshi the resultant path must support.
-            k: (int) maximum number of paths to return.
+            failed_paths: (list) previously yielded routes to skip.
 
         Returns:
             a generator that produces a list of possible paths, from best to worst.
 
         Raises:
             NetworkXError: if self or dest are not in the input graph.
-            NetworkXNoPath: if no path exists from src to dest.
+            NetworkXNoPath: if no other paths exists from src to dest.
         """
         if self not in G:
             raise nx.NodeNotFound("Src [%s] not in graph" % self)
@@ -413,10 +453,22 @@ class Node:
 
         shortest_path_func = _bidirectional_dijkstra
 
-        listA = list()
+        # failed_paths is in form [(length, path)]
+
+        listA = []  # Previously yielded paths
         listB = PathBuffer()
-        prev_path = None
-        while len(listA) < k:
+
+        for p in failed_paths:
+            listA.append(p[1])
+            listB.push(p[0], p[1])
+            listB.pop()
+
+        if len(listA) > 0:
+            prev_path = listA[-1]
+        else:
+            prev_path = None
+
+        while len(listA) <= len(failed_paths) and len(listA) < MAX_PATH_ATTEMPTS:
             if not prev_path:
                 length, path = shortest_path_func(G, self, dest, weight=weight)
                 listB.push(length, path)
@@ -473,18 +525,20 @@ class Node:
 
         # Finds shortest path based on lowest fees, for now.
         if self in searchable and dest in searchable:
-            failed_routes = []
-
             if subpayment:
-                failed_routes = self._amp_out[subpayment[0]][0][subpayment[1]]
-                # print(failed_routes)
+                id, i, n = subpayment
+                failed_routes = self._amp_out[id][0][i]
 
-            if test_mode:
-                paths = [p for p in all_shortest_paths(searchable, self, dest, \
-                            weight=lambda u, v, d: d["fees"][0] + d["fees"][1] * amnt) \
-                            if p not in failed_routes]
+                if test_mode:
+                    failed_routes = [p[1] for p in failed_routes]
+                    paths = [p for p in all_shortest_paths(searchable, self, dest, \
+                                weight=lambda u, v, d: d["fees"][0] + d["fees"][1] * amnt) \
+                                if p not in failed_routes]
+                else:
+                    paths = [p for p in self._find_path(searchable, dest, 0, failed_routes)]
             else:
-                paths = [p for p in self._find_path(searchable, dest, 0) if p not in failed_routes]
+                # Only try best path once for regular payments
+                paths = [dijkstra_path(searchable, self, dest, weight=lambda u, v, d: d["fees"][0] + d["fees"][1] * amnt)]
 
             if len(paths) == 0:
                 if debug: print("Error: no remaining possible routes [%d]." % subpayment[1])
@@ -494,8 +548,7 @@ class Node:
 
             if len(path) - 1 > MAX_HOPS:
                 if debug: print("Error: path exceeds max-hop distance [%d]." % subpayment[1])
-                # @TODO: this needs to be changed - update the state instead
-                failed_routes.append(path)
+                if subpayment: self._amp_out[id][0][i].append(path)
                 return False
 
             send_amnts = calc_path_fees(G, path, amnt)
@@ -919,13 +972,30 @@ CORE FUNCTIONALITY TESTING
 def test_func():
     TEST_DEBUG = False
 
-    ################## func: _init_payment [NON-AMP] ###########
-    if TEST_DEBUG: print("// SUCCESSFUL PAYMENT\n-------------------------")
+    ################## func: send_direct ###########
+    if TEST_DEBUG: print("// SUCCESSFUL DIRECT TRANSFER\n-------------------------")
 
     G, pairs = generate_wattz_strogatz(NUM_TEST_NODES, 6, 0.3, 10, True)
     nodes = list(G)
 
     node_comm = NodeCommunicator(nodes, pairs, test_mode=True, debug=TEST_DEBUG)
+
+    e_4_5 = G[nodes[4]][nodes[5]]["equity"]
+    e_5_4 = G[nodes[5]][nodes[4]]["equity"]
+
+    nodes[4].send_direct(G, nodes[5], 10, node_comm, debug=TEST_DEBUG)
+    nodes[5].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
+
+    assert G[nodes[4]][nodes[5]]["equity"] == e_4_5 - 10
+    assert G[nodes[5]][nodes[4]]["equity"] == e_5_4 + 10
+
+    if TEST_DEBUG: print("// FAILED DIRECT TRANSFER - NO CHANNEL\n-------------------------")
+
+    attempt = nodes[4].send_direct(G, nodes[17], 5, node_comm, debug=TEST_DEBUG)
+    assert attempt == False
+
+    ################## func: _init_payment [NON-AMP] ###########
+    if TEST_DEBUG: print("// SUCCESSFUL PAYMENT\n-------------------------")
 
     # Payment from 0 to 14 will find path 0-1-14
     path = [nodes[0], nodes[1], nodes[14]]
@@ -937,7 +1007,7 @@ def test_func():
     e_14_1 = G[nodes[14]][nodes[1]]["equity"]
 
     # Initialise by sending message from 0 to 1 and propagating out and in.
-    nodes[0]._init_payment(G, nodes[14], 10, node_comm, debug=TEST_DEBUG)
+    nodes[0]._init_payment(G, nodes[14], 10, node_comm, test_mode=True, debug=TEST_DEBUG)
     nodes[1].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
     nodes[14].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
     nodes[1].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
@@ -952,7 +1022,7 @@ def test_func():
 
     # There's no more equity from 1 to 14, so try this route again to test
     # for funds being released back correctly when a route fails mid-way forward.
-    nodes[0]._init_payment(G, nodes[14], 5, node_comm, debug=TEST_DEBUG)
+    nodes[0]._init_payment(G, nodes[14], 5, node_comm, test_mode=True, debug=TEST_DEBUG)
     nodes[1].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
     nodes[0].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
 
@@ -964,7 +1034,7 @@ def test_func():
 
     # No route available
     if TEST_DEBUG: print("\n// NO ROUTE AVAILABLE\n-------------------------")
-    assert nodes[0]._init_payment(G, nodes[14], 100, node_comm, debug=TEST_DEBUG) == False
+    assert nodes[0]._init_payment(G, nodes[14], 100, node_comm, test_mode=True, debug=TEST_DEBUG) == False
 
     # One-hop payments - make sure finds direct path.
     if TEST_DEBUG: print("\n// ONE-HOP PAYMENT\n-------------------------")
@@ -975,7 +1045,7 @@ def test_func():
     e_11_9 = G[nodes[11]][nodes[9]]["equity"]
     e_9_11 = G[nodes[9]][nodes[11]]["equity"]
 
-    nodes[11]._init_payment(G, nodes[9], 5, node_comm, debug=TEST_DEBUG)
+    nodes[11]._init_payment(G, nodes[9], 5, node_comm, test_mode=True, debug=TEST_DEBUG)
     nodes[9].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
 
     assert G[nodes[11]][nodes[9]]["equity"] == e_11_9 - amnts[0]
@@ -1008,7 +1078,7 @@ def test_func():
     e_1_14 = G[nodes[1]][nodes[14]]["equity"]
     e_14_1 = G[nodes[14]][nodes[1]]["equity"]
 
-    nodes[0].init_payment(G, nodes[14], 10, node_comm, k=3, debug=TEST_DEBUG)
+    nodes[0].init_payment(G, nodes[14], 10, node_comm, k=3, test_mode=True, debug=TEST_DEBUG)
     nodes[1].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
     nodes[14].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
     nodes[1].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
@@ -1104,7 +1174,7 @@ def test_func():
     e_19_14 = G[nodes[19]][nodes[14]]["equity"]
     e_14_19 = G[nodes[14]][nodes[19]]["equity"]
 
-    nodes[0].init_payment(G, nodes[14], 15, node_comm, k=3, debug=TEST_DEBUG)
+    nodes[0].init_payment(G, nodes[14], 15, node_comm, k=3, test_mode=True, debug=TEST_DEBUG)
     nodes[1].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
     nodes[14].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
     nodes[1].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
@@ -1117,12 +1187,12 @@ def test_func():
     nodes[14].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
 
     # Knows base preimage, so HTLCs released back
-    nodes[19].process_next_packet(G, node_comm, debug=TEST_DEBUG)
-    nodes[0].process_next_packet(G, node_comm, debug=TEST_DEBUG)
-    nodes[1].process_next_packet(G, node_comm, debug=TEST_DEBUG)
-    nodes[0].process_next_packet(G, node_comm, debug=TEST_DEBUG)
-    nodes[1].process_next_packet(G, node_comm, debug=TEST_DEBUG)
-    nodes[0].process_next_packet(G, node_comm, debug=TEST_DEBUG)
+    nodes[19].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
+    nodes[0].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
+    nodes[1].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
+    nodes[0].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
+    nodes[1].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
+    nodes[0].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
 
     # 2 on 0-1-14, 1 on 0-19-14
     assert G[nodes[0]][nodes[1]]["equity"] == e_0_1 - amnts[0] * 2
@@ -1146,7 +1216,7 @@ def test_func():
     e_1_0 = G[nodes[1]][nodes[0]]["equity"]
 
     node_comm.set_latency(nodes[0], nodes[1], 10)
-    nodes[0]._init_payment(G, nodes[1], 5, node_comm, debug=TEST_DEBUG)
+    nodes[0]._init_payment(G, nodes[1], 5, node_comm, test_mode=True, debug=TEST_DEBUG)
     nodes[1].process_next_packet(G, node_comm, debug=TEST_DEBUG)
 
     # Should be no change as packet hasn't "reached" 1 yet.
@@ -1155,14 +1225,15 @@ def test_func():
 
     # Try again with no latency, new payment, old still won't have made it
     node_comm.set_latency(nodes[0], nodes[1], 0)
-    nodes[0]._init_payment(G, nodes[1], 5, node_comm, debug=TEST_DEBUG)
+    nodes[0]._init_payment(G, nodes[1], 5, node_comm, test_mode=True, debug=TEST_DEBUG)
     nodes[1].process_next_packet(G, node_comm, debug=TEST_DEBUG)
 
     # Should be no change as packet hasn't "reached" 1 yet.
     assert G[nodes[0]][nodes[1]]["equity"] == e_0_1 - 5
     assert G[nodes[1]][nodes[0]]["equity"] == e_1_0 + 5
 
+
 if __name__ == "__main__":
     test_func()
 
-# simulator()
+simulator()
