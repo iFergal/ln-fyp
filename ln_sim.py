@@ -23,25 +23,33 @@ CONFIGURATION
 /////////////
 """
 
-NUM_NODES = 200  # Spirtes paper uses 2k
+DEBUG = True
+NUM_NODES = 2000  # Spirtes paper uses 2k
 NUM_TEST_NODES = 20
+TOTAL_TO_SEND = 5000
+RESEND_FREQ = 10  # How often to resend new payments (number of loops)
+NUM_TO_RESEND = 10  # Amount of payments to resend
+
 MAX_HOPS = 20  # LN standard
 AMP_TIMEOUT = 60  # 60 seconds in c-lightning
-DEBUG = False
-NUM_STARTING_PAYMENTS = 50
+NUM_STARTING_PAYMENTS = 1000
 MERCHANT_PROB = 0.67
 LATENCY_OPTIONS = [0.1, 1, 10]  # Sprites paper, in seconds
-LATENCY_DISTRIBUTION = [1, 0, 0] #0.925, 0.049, 0.026]
+LATENCY_DISTRIBUTION = [0.925, 0.049, 0.026]
 CTLV_OPTIONS = [9]  # Default on LN for now
 CTLV_DISTRIBUTION = [1]
 CLTV_MULTIPLIER = 600  # BTC block time is ~10 minutes, so 600 seconds
 DELAY_RESP_VAL = [0, 0.2, 0.4, 0.6, 0.8, 1]  # Amount of timelock time node will wait before cancelling/claiming
-DELAY_RESP_DISTRIBUTION = [1, 0, 0, 0, 0, 0]#0.9, 0.05, 0.01, 0.005, 0.005, 0.03]
+DELAY_RESP_DISTRIBUTION = [0.9, 0, 0, 0, 0, 0.1]#0.9, 0.05, 0.01, 0.005, 0.005, 0.03]
 MAX_PATH_ATTEMPTS = 30  # For AMP, if we try a subpayment on this many paths and fail, stop
+ENCRYPTION_DELAYS = [0]  # For now, setting these to 0 as latency should include this.
+ENCRYPTION_DELAY_DISTRIBUTION = [1]
+DECRYPTION_DELAYS = [0]
+DECRYPTION_DELAY_DISTRIBUTION = [1]
 
 # Consumers pay merchants - this is the chance for different role,
 # i.e. merchant to pay or consumer to receive, [0, 0.5] - 0.5 means both as likely as each other
-ROLE_BIAS = 0.05
+ROLE_BIAS = 0.5
 
 # Terminal output colours
 class bcolours:
@@ -91,7 +99,7 @@ class Packet:
         self._htlc_ids = []
         self._timestamp = None
         self._final_index = len(path) - 1
-        self._delayed = False
+        self._delayed = [False] * (len(path) - 1)
 
     def get_path(self):
         return self._path
@@ -132,11 +140,11 @@ class Packet:
     def get_htlc_id(self, index):
         return self._htlc_ids[index]
 
-    def is_delayed(self):
-        return self._delayed
+    def is_delayed(self, index):
+        return self._delayed[index]
 
-    def set_delayed(self):
-        self._delayed = True
+    def set_delayed(self, index):
+        self._delayed[index] = True
 
     def __lt__(self, other):
         return self.get_timestamp() < other.get_timestamp()
@@ -150,13 +158,17 @@ class Node:
         merchant: (boolean) True if a merchant, False if consumer. (consumer more likely to spend)
         spend_freq: (float) likelihood of selection to make next payment.
         receive_freq: (float) likelihood of selection to receive next payment.
+        encryption_delay: (float) seconds it takes to encrypt a full packet.
+        decryption_delay: (float) seconds it takes to decrypt a layer of a packet.
     """
 
-    def __init__(self, id, merchant, spend_freq, receive_freq):
+    def __init__(self, id, merchant, spend_freq, receive_freq, encryption_delay, decryption_delay):
         self._id = id
         self._merchant = merchant
         self._spend_freq = spend_freq
         self._receive_freq = receive_freq
+        self._encryption_delay = encryption_delay
+        self._decryption_delay = decryption_delay
         self._amp_out = {}  # Outgoing AMPs still active
         self._amp_in = {}  # Awaiting incoming AMPs
         self._htlc_out = {}  # Maps other nodes to HTLCs
@@ -173,6 +185,9 @@ class Node:
 
     def get_receive_freq(self):
         return self._receive_freq
+
+    def get_decryption_delay(self):
+        return self._decryption_delay
 
     def update_htlc_out(self, node, id, amnt, ttl):
         """Neighbouring nodes can add new HTLC info when established on their channel.
@@ -241,6 +256,7 @@ class Node:
                 if G[src][self]["equity"] >= amnt:
                     G[src][self]["equity"] -= amnt  # To HTLC
                     if type == "pay":
+                        success_count += 1
                         G[self][src]["equity"] += amnt
                         if debug: print("Sent %.4f from %s to %s." % (amnt, src, self) + (" [%d]" % subpayment[1] if subpayment else ""))
                     else:
@@ -258,6 +274,7 @@ class Node:
 
                                 dest = p.get_node(index - 1)
                                 p.set_type("preimage")
+                                p.set_timestamp(time.time() + dest.get_decryption_delay())
 
                                 if debug: print("Received payment - sending preimage release message to node communicator from %s (-> %s)." % (self, dest))
                                 node_comm.send_packet(self, dest, p)
@@ -278,6 +295,8 @@ class Node:
                                             G[self][dest]["equity"] += amnt
 
                                             s.set_type("preimage")
+                                            p.set_timestamp(time.time() + dest.get_decryption_delay())
+
                                             if debug: print("Sending preimage release message to node communicator from %s (-> %s). [%d]" % (self, dest, subpayment[1]))
                                             node_comm.send_packet(self, dest, s)
                                         del self._amp_in[id]
@@ -289,6 +308,8 @@ class Node:
                                         G[self][dest]["equity"] += amnt
 
                                         s.set_type("cancel")
+                                        p.set_timestamp(time.time() + dest.get_decryption_delay())
+
                                         if debug: print("Sending cancel message to node communicator from %s (-> %s). [%d]" % (self, dest, subpayment[1]))
                                         node_comm.send_packet(self, dest, s)
                         else:
@@ -296,17 +317,23 @@ class Node:
                             dest = p.get_node(index + 1)
                             amnt = p.get_amnt(index)
                             if G[self][dest]["equity"] >= amnt:
+                                p.set_timestamp(time.time() + dest.get_decryption_delay())
+
                                 if debug: print("Sending pay_htlc message to node communicator from %s (-> %s)." % (self, dest) + (" [%d]" % subpayment[1] if subpayment else ""))
                                 node_comm.send_packet(self, dest, p)
                             else:
                                 if debug: print(bcolours.FAIL + "Error: equity between %s and %s not available for transfer - reversing." % (src, self) + (" [%d]" % subpayment[1] if subpayment else "") + bcolours.ENDC)
                                 p.set_type("cancel")
+                                p.set_timestamp(time.time() + p.get_node(index - 1).get_decryption_delay())
+
                                 node_comm.send_packet(self, p.get_node(index - 1), p)
                 else:
                     if debug: print(bcolours.FAIL + "Error: equity between %s and %s not available for transfer." % (src, self) + (" [%d]" % subpayment[1] if subpayment else "") + bcolours.ENDC)
 
                     dest = p.get_node(index - 1)  # Propagate back CANCEL
                     p.set_type("cancel_rest")  # Not regular cancel as no HTLC with prev. node.
+                    p.set_timestamp(time.time() + dest.get_decryption_delay())
+
                     if debug: print("Sending cancellation message to node communicator from %s (-> %s)." % (self, dest) + (" [%d]" % subpayment[1] if subpayment else ""))
                     node_comm.send_packet(self, dest, p)
             elif type == "preimage":
@@ -320,6 +347,8 @@ class Node:
                     if debug:
                         print("%s claimed back %.4f from payment to %s." % (self, amnt, dest) + (" [%d]" % subpayment[1] if subpayment else ""))
                         print("Sending preimage release message to node communicator from %s (-> %s)." % (self, dest) + (" [%d]" % subpayment[1] if subpayment else ""))
+
+                    p.set_timestamp(time.time() + dest.get_decryption_delay())
                     node_comm.send_packet(self, dest, p)
                 else:  # Sender, receipt come back
                     if not subpayment:
@@ -327,7 +356,7 @@ class Node:
 
                     if debug:
                         j = p.get_final_index()
-                        print(bcolours.OKGREEN + "Payment [%s -> %s // %.4f] successly completed." % (self, p.get_node(j), p.get_amnt(j-1)) + (" [%d]" % subpayment[1] if subpayment else "") + bcolours.ENDC)
+                        print(bcolours.OKGREEN + "Payment [%s -> %s // %.4f] successfully completed." % (self, p.get_node(j), p.get_amnt(j-1)) + (" [%d]" % subpayment[1] if subpayment else "") + bcolours.ENDC)
 
                     if p.get_subpayment() and p.get_subpayment()[0] in self._amp_out:
                         # Then, receiver must have got all of AMP
@@ -340,7 +369,7 @@ class Node:
                 dest = p.get_node(index + 1)
                 amnt = p.get_amnt(index)
 
-                if not p.is_delayed():
+                if not p.is_delayed(index):
                     cancel_chance = np.random.choice(DELAY_RESP_VAL, 1, p=DELAY_RESP_DISTRIBUTION)[0] if not test_mode else 0
 
                     # Some unresponsive or malicious nodes might delay the cancellation
@@ -348,14 +377,15 @@ class Node:
                         # Simulate this by requeuing the Packet with an updated timestamp to open
                         ttl = time.time() + node_comm.get_ctlv_delta(self, dest) * CLTV_MULTIPLIER * cancel_chance
                         p.set_timestamp(ttl)
-                        p.set_delayed()
+                        p.set_delayed(index)
                         self._queue.put(p)
 
                         if debug: print("%s is waiting for %.4f of HTLC timeout before signing..." % (self, cancel_chance))
                         return
 
                 if p.get_type() == "cancel":  # Not cancel_rest
-                    del self._htlc_out[dest][p.get_htlc_id(index)]
+                    if p.get_htlc_id(index) in self._htlc_out[dest]:  # @TODO: why is this check required...
+                        del self._htlc_out[dest][p.get_htlc_id(index)]
 
                     G[self][dest]["equity"] += amnt  # Claim back
                     if debug: print("%s cancelled HTLC and claimed back %.4f from payment to %s." % (self, amnt, dest) + (" [%d]" % subpayment[1] if subpayment else ""))
@@ -368,6 +398,8 @@ class Node:
 
                 if index != 0:  # Send cancel message on
                     dest = p.get_node(index - 1)
+                    p.set_timestamp(time.time() + dest.get_decryption_delay())
+
                     if debug: print("Sending cancellation message to node communicator from %s (-> %s)." % (self, dest) + (" [%d]" % subpayment[1] if subpayment else ""))
                     node_comm.send_packet(self, dest, p)
                 elif subpayment:  # Partial payment of AMP failed
@@ -421,6 +453,8 @@ class Node:
                     amnt = p.get_amnt(index - 1)
 
                     p.set_type("cancel")
+                    p.set_timestamp(time.time() + dest.get_decryption_delay())
+
                     if debug: print("Sending cancel message to node communicator from %s (-> %s)." % (self, dest))
                     node_comm.send_packet(self, dest, p)
                 to_delete.append(id)
@@ -447,6 +481,7 @@ class Node:
             index_mapping = {path[i].get_id(): i for i in range(len(path))}
 
             p = Packet(path, index_mapping, [amnt], "pay", False)
+            p.set_timestamp(time.time() + dest.get_decryption_delay())
             node_comm.send_packet(self, dest, p)
 
             if debug: print("Sending pay message to node communicator from %s (-> %s)." % (self, dest))
@@ -585,6 +620,8 @@ class Node:
         p = Packet(path, index_mapping, send_amnts, type,
             (subpayment[0], subpayment[1], subpayment[2], ttl) if subpayment else False)
 
+        p.set_timestamp(time.time() + self._encryption_delay + dest.get_decryption_delay())
+
         if debug: print("Sending %s message to node communicator from %s (-> %s)." % (type, self, path[1]) + (" [%d]" % subpayment[1] if subpayment else ""))
         node_comm.send_packet(self, path[1], p)
 
@@ -691,7 +728,7 @@ class NodeCommunicator:
         """Processes and sends a packet from src to dest. """
         if self._debug: print(bcolours.HEADER + "[NODE-COMM] Relaying message between %s and %s." % (src, dest) + bcolours.ENDC)
 
-        packet.set_timestamp(time.time() + self._latencies[(src, dest)])
+        packet.set_timestamp(packet.get_timestamp() + self._latencies[(src, dest)])
         dest.receive_packet(packet, self._debug)
 
     def record_stat(self):
@@ -863,13 +900,18 @@ def init_random_node(i):
     # 0 - never selected, 1 - as likely as possible.
     spend_freq = 1
     receive_freq = 1
+    encryption_delay = np.random.choice(ENCRYPTION_DELAYS, 1, p=ENCRYPTION_DELAY_DISTRIBUTION)[0]
+    decryption_delay = np.random.choice(DECRYPTION_DELAYS, 1, p=DECRYPTION_DELAY_DISTRIBUTION)[0]
 
-    return Node(i, merchant, spend_freq, receive_freq)
+    return Node(i, merchant, spend_freq, receive_freq, encryption_delay, decryption_delay)
 
 def generate_edge_args():
     """Generate random equity and fee distribution arguments for a new pair of edges. """
-    dir_a = [20, [0.1, 0.005]]
-    dir_b = [10, [0.1, 0.005]]
+    amnt_a = np.random.choice([8500000, 500000], 1, p=[0.2, 0.8])[0]
+    amnt_b = np.random.choice([8500000, 500000], 1, p=[0.2, 0.8])[0]
+
+    dir_a = [amnt_a, [1, 0.000001]]  # Default fees, also LN median
+    dir_b = [amnt_b, [1, 0.000001]]
 
     return [dir_a, dir_b]
 
@@ -899,7 +941,7 @@ def generate_wattz_strogatz(n, k, p, seed=None, test=False):
 
     G = nx.DiGraph()
     if test:
-        nodes = [Node(i, False, 0, 0) for i in range(n)]
+        nodes = [Node(i, False, 0, 0, 0, 0) for i in range(n)]
     else:
         nodes = [init_random_node(i) for i in range(n)]
 
@@ -957,7 +999,6 @@ def generate_barabasi_albert(n, m, seed=None):
     Args:
         n: (int) the number of nodes in the generated graph.
         m: (int) the number of edges to attach from a new node to existing nodes.
-        node_comm: (NodeCommunicator) main communicator for each node to send packets to.
         seed: (int) seed for RNG. (None by default)
 
     Returns:
@@ -1031,19 +1072,23 @@ def select_payment_nodes(consumers, merchants, total_freqs):
     return src_node, dest_node
 
 def select_pay_amnt(G, node):
-    """Returns an appropriate spend amount (satoshi) for the selected node.
+    """Returns an appropriate spend amount (satoshi) for the selected node."""
+    max_amnt = 500000 #node.get_largest_outgoing_equity(G)
 
-    Note: @TODO - do we select an always possible amount or allow for auto-failures?
-    """
-    max_amnt = node.get_largest_outgoing_equity(G)
-
-    return np.random.randint(1, max_amnt + 1)
+    # return np.random.randint(1, max_amnt + 1)
+    # multiplier = np.random.choice([0.2, 0.4, 0.6, 0.8], 1, [0.8, 0.05, 0.05, 0.05])[0]
+    # return floor(max_amnt * multiplier)
+    return 60000
 
 def simulator():
     """Main simulator calling function. """
-    G, pairs = generate_wattz_strogatz(NUM_NODES, 6, 0.3)
-    # G, pairs = generate_barabasi_albert(NUM_NODES, floor(NUM_NODES / 4))
+    start_time = time.time()
+    G, pairs = generate_wattz_strogatz(NUM_NODES, 10, 0.3)
+    # G, pairs = generate_barabasi_albert(NUM_NODES, 5)
     nodes = list(G)
+
+    # nx.draw(G)
+    # plt.show()
 
     node_comm = NodeCommunicator(nodes, pairs, debug=False)
 
@@ -1068,26 +1113,53 @@ def simulator():
 
     if DEBUG: print("// INIT NUM_STARTING_PAYMENTS PAYMENTS\n-------------------------")
 
+    sent_payments = 0
+
     for i in range(NUM_STARTING_PAYMENTS):
         selected = select_payment_nodes(consumers, merchants, total_freqs)
-        amnt = select_pay_amnt(G, selected[0])
 
+        while selected[0] == selected[1]:
+            selected = select_payment_nodes(consumers, merchants, total_freqs)
+
+        amnt = select_pay_amnt(G, selected[0])
         selected[0].init_payment(G, selected[1], amnt, node_comm)
+        sent_payments += 1
 
     if DEBUG: print("// SIMULATION LOOP BEGIN\n-------------------------")
 
     total_payments_sent = NUM_STARTING_PAYMENTS
-    while success_count + fail_count < total_payments_sent:
-        for node in nodes:  # For now, pop one packet per node
-            node.process_next_packet(G, node_comm)
+
+    while True:
+        if success_count + fail_count >= TOTAL_TO_SEND:
+            break
+
+        if (success_count + fail_count) % RESEND_FREQ == 0:
+            print("# successful payments:", success_count)
+            print("# failed payments:", fail_count)
+
+            for i in range(NUM_TO_RESEND):
+                selected = select_payment_nodes(consumers, merchants, total_freqs)
+
+                while selected[0] == selected[1]:
+                    selected = select_payment_nodes(consumers, merchants, total_freqs)
+
+                amnt = select_pay_amnt(G, selected[0])
+
+                selected[0].init_payment(G, selected[1], amnt, node_comm)
+                sent_payments += 1
+        try:
+            for node in nodes:
+                for _ in range(G.in_degree(node)):
+                    node.process_next_packet(G, node_comm)
+        except KeyboardInterrupt:
+            break
 
     print("// ANALYTICS\n-------------------------")
     print("# successful payments:", success_count)
     print("# failed payments:", fail_count)
     print("# amp retries:", amp_retry_count)
 
-    # nx.draw(G)
-    # plt.show()
+    print(time.time() - start_time)
 
 """
 //////////////////////////
