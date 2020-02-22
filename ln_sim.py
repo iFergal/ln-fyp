@@ -23,24 +23,27 @@ CONFIGURATION
 /////////////
 """
 
-DEBUG = True
+DEBUG = False
 NUM_NODES = 2000  # Spirtes paper uses 2k
 NUM_TEST_NODES = 20
-TOTAL_TO_SEND = 5000
+TOTAL_TO_SEND = 7000
 RESEND_FREQ = 10  # How often to resend new payments (number of loops)
 NUM_TO_RESEND = 10  # Amount of payments to resend
 
+CHEAPEST_PATH = False
+
+AMP_RESEND = False  # Retry flag for AMP payments
+
 MAX_HOPS = 20  # LN standard
 AMP_TIMEOUT = 60  # 60 seconds in c-lightning
-NUM_STARTING_PAYMENTS = 1000
 MERCHANT_PROB = 0.67
-LATENCY_OPTIONS = [0.1, 1, 10]  # Sprites paper, in seconds
+LATENCY_OPTIONS = [0.01, 0.1, 1]  # Sprites paper, in seconds, scaled down to 10%
 LATENCY_DISTRIBUTION = [0.925, 0.049, 0.026]
 CTLV_OPTIONS = [9]  # Default on LN for now
 CTLV_DISTRIBUTION = [1]
 CLTV_MULTIPLIER = 600  # BTC block time is ~10 minutes, so 600 seconds
 DELAY_RESP_VAL = [0, 0.2, 0.4, 0.6, 0.8, 1]  # Amount of timelock time node will wait before cancelling/claiming
-DELAY_RESP_DISTRIBUTION = [0.9, 0, 0, 0, 0, 0.1]#0.9, 0.05, 0.01, 0.005, 0.005, 0.03]
+DELAY_RESP_DISTRIBUTION = [1, 0, 0, 0, 0, 0]#0.9, 0.05, 0.01, 0.005, 0.005, 0.03]
 MAX_PATH_ATTEMPTS = 30  # For AMP, if we try a subpayment on this many paths and fail, stop
 ENCRYPTION_DELAYS = [0]  # For now, setting these to 0 as latency should include this.
 ENCRYPTION_DELAY_DISTRIBUTION = [1]
@@ -49,7 +52,7 @@ DECRYPTION_DELAY_DISTRIBUTION = [1]
 
 # Consumers pay merchants - this is the chance for different role,
 # i.e. merchant to pay or consumer to receive, [0, 0.5] - 0.5 means both as likely as each other
-ROLE_BIAS = 0.5
+ROLE_BIAS = 0.0
 
 # Terminal output colours
 class bcolours:
@@ -63,6 +66,8 @@ class bcolours:
 success_count = 0
 fail_count = 0
 amp_retry_count = 0
+total_path_hops = 0
+total_paths_found = 0
 
 """
 //////////////////
@@ -407,7 +412,7 @@ class Node:
                     id, i, k, ttl = subpayment
 
                     if id in self._amp_out:  # Still on-going
-                        if time.time() < ttl and self._amp_out[id][2]:
+                        if AMP_RESEND and time.time() < ttl and self._amp_out[id][2]:
                             # Still within time limit - so try again!
                             # In Rusty Russell podcast - c-lightning is 60 seconds.
                             j = p.get_final_index()
@@ -490,7 +495,7 @@ class Node:
             if debug: print(bcolours.FAIL + "Error: no direct payment channel between %s and %s." % (self, dest) + bcolours.ENDC)
             return False
 
-    def _find_path(self, G, dest, amnt, failed_paths):
+    def _find_path(self, G, dest, amnt, failed_paths, k=False):
         """Attempt to find the next shortest path from self to dest within graph G, that is not in failed_paths.
 
         Adapted from NetworkX shorest_simple_paths src code.
@@ -500,6 +505,64 @@ class Node:
             dest: (Node) destination node to attempt to find best path to.
             amnt: (float) number of satoshi the resultant path must support.
             failed_paths: (list) previously yielded routes to skip.
+            k: (int) number of new paths to find.
+
+        Returns:
+            a generator that produces a list of possible paths, from best to worst,
+            or False if no paths exist.
+
+        Raises:
+            NetworkXError: if self or dest are not in the input graph.
+        """
+        if self not in G:
+            raise nx.NodeNotFound("Src [%s] not in graph" % self)
+
+        if dest not in G:
+            raise nx.NodeNotFound("Dest [%s] not in graph" % dest)
+
+        def length_func(path):
+            send_amnts = calc_path_fees(G, path, amnt)
+            return send_amnts[0] - amnt
+
+        shortest_path_func = _dijkstra_reverse
+
+        listA = []  # Previously yielded paths
+        listB = PathBuffer()
+
+        num_to_find = len(failed_paths) if not k else k - 1
+
+        # Find one new path per func call, up until a global maximum.
+        while len(listA) <= num_to_find and len(listA) < MAX_PATH_ATTEMPTS:
+            avoid_edges = []
+            to_avoid = listA if k else failed_paths
+            for p in to_avoid:
+                for i in range(len(p) - 1):
+                    avoid_edges.append((p[i], p[i+1]))
+
+            attempt = shortest_path_func(G, self, dest, amnt, avoid_edges)
+
+            if attempt:
+                length, path = attempt
+                listB.push(length, path)
+
+            if listB:
+                path = listB.pop()
+                yield path
+                listA.append(path)
+            else:
+                return False
+
+    def _find_path_old(self, G, dest, amnt, failed_paths, k=False):
+        """Attempt to find the next shortest path from self to dest within graph G, that is not in failed_paths.
+
+        Adapted from NetworkX shorest_simple_paths src code.
+
+        Args:
+            G: NetworkX graph in use.
+            dest: (Node) destination node to attempt to find best path to.
+            amnt: (float) number of satoshi the resultant path must support.
+            failed_paths: (list) previously yielded routes to skip.
+            k: (int) number of new paths to find.
 
         Returns:
             a generator that produces a list of possible paths, from best to worst.
@@ -533,8 +596,10 @@ class Node:
         else:
             prev_path = None
 
+        num_to_find = len(failed_paths) if not k else k - 1
+
         # Find one new path per func call, up until a global maximum.
-        while len(listA) <= len(failed_paths) and len(listA) < MAX_PATH_ATTEMPTS:
+        while len(listA) <= num_to_find and len(listA) < MAX_PATH_ATTEMPTS:
             if not prev_path:
                 length, path = shortest_path_func(G, self, dest, amnt)
                 listB.push(length, path)
@@ -566,7 +631,7 @@ class Node:
             else:
                 raise nx.NetworkXNoPath()
 
-    def _init_payment(self, G, dest, amnt, node_comm, subpayment=False, test_mode=False, debug=DEBUG):
+    def _init_payment(self, G, dest, amnt, node_comm, subpayment=False, routes=[], route_index=0, test_mode=False, debug=DEBUG):
         """Initialise a regular single payment from this node to destination node of amnt.
 
         Args:
@@ -577,6 +642,8 @@ class Node:
             subpayment: (boolean / (UUID, int, int))
                 - (ID of subpayment group, index of subpayment, total num subpayments),
                 - or False if not AMP.
+            routes: (List<List<Node>>) preset routes to try.
+            route_index: (int) index for which route in routes to try for this subpayment.
             test_mode: (boolean) True if running from test function.
             debug: (boolean) True to display debug print statements.
 
@@ -586,17 +653,26 @@ class Node:
         """
         # Analytics
         global fail_count
+        global total_path_hops
+        global total_paths_found
 
         if subpayment:
-            id, i, n = subpayment
-            failed_routes = self._amp_out[id][0][i]
+            if len(routes) > 0:
+                paths = [routes[route_index]]
 
-            paths = [p for p in self._find_path(G, dest, amnt, failed_routes)]
+                # For now, set all failed_routes for future as routes
+                id, i, n = subpayment
+                self._amp_out[id][0][i] = routes
+            else:
+                id, i, n = subpayment
+                failed_routes = self._amp_out[id][0][i]
+
+                paths = [p for p in self._find_path(G, dest, amnt, failed_routes)]
         else:
             # Only try best path once for regular payments
             paths = [_dijkstra_reverse(G, self, dest, amnt)]
 
-        if paths[0] is False or len(paths) == 0:
+        if len(paths) == 0 or paths[0] is False:
             if debug: print(bcolours.FAIL + "Error: no possible routes available." + (" [%d]" % subpayment[1] if subpayment else "") + bcolours.ENDC)
             if subpayment:
                 self._amp_out[id][2] = False
@@ -606,6 +682,8 @@ class Node:
             return False
 
         path = paths[0] if subpayment else paths[0][1]
+        total_path_hops += len(path)
+        total_paths_found += 1
 
         if len(path) - 1 > MAX_HOPS:
             if debug: print(bcolours.FAIL + "Error: path exceeds max-hop distance" + (" [%d]" % subpayment[1] if subpayment else "") + bcolours.ENDC)
@@ -644,21 +722,19 @@ class Node:
         if k == 1:
             self._init_payment(G, dest, amnt, node_comm, False, test_mode=test_mode, debug=debug)
         else:  # AMP
-            amnts = [floor(amnt / k) for _ in range(k-1)]
-            last = amnt - sum(amnts)
-            amnts.append(last)
-
             # Of form, [subpayment index, failed routes]
-            subp_statuses = [[] for i in range(len(amnts))]
+            subp_statuses = [[] for i in range(k)]
             id = uuid4()
 
             # After timeout, attempt at AMP cancelled
             ttl = time.time() + AMP_TIMEOUT
             self._amp_out[id] = [subp_statuses, ttl, True]  # True here means hasn't failed yet
 
+            routes = [p for p in self._find_path(G, dest, amnt / k, [], k=k)]
+
             # Send off each subpayment - first attempt.
-            for i in range(len(amnts)):
-                self._init_payment(G, dest, amnts[i], node_comm, (id, i, k), test_mode=test_mode, debug=debug)
+            for i in range(k):
+                self._init_payment(G, dest, amnt / k, node_comm, (id, i, k), routes=routes, route_index=i, test_mode=test_mode, debug=debug)
 
     def get_total_equity(self, G):
         """Returns the total equity held by a node (not locked up in HTLCs). """
@@ -794,7 +870,7 @@ def graph_str(G):
 
     return str
 
-def _dijkstra_reverse(G, source, target, initial_amnt, ignore_nodes=None, ignore_edges=None):
+def _dijkstra_reverse(G, source, target, initial_amnt, avoid_edges=None):
     """Find a path from source to target, starting the search from the target towards source.
 
     Only supports directed graph.
@@ -808,8 +884,7 @@ def _dijkstra_reverse(G, source, target, initial_amnt, ignore_nodes=None, ignore
         source: (Node) source node.
         target: (Node) destination node.
         initial_amnt: (float) amnt of satoshi intended to be transferred on the last hop to the target.
-        ignore_nodes: (set<Node>) nodes to ignore when path finding.
-        ignore_edges: (set<Node>) edges to ignore when path finding.
+        avoid_edges: (list<Node>) when path finding, increase weight of these edges to avoid.
 
     Returns:
         the length of the shortest path found, using the given weight function and,
@@ -821,28 +896,6 @@ def _dijkstra_reverse(G, source, target, initial_amnt, ignore_nodes=None, ignore
     weight = lambda d, amnt: d["fees"][0] + d["fees"][1] * amnt
 
     Gsucc = G.successors
-
-    # Support optional nodes filter
-    if ignore_nodes:
-        def filter_iter(nodes):
-            def iterate(v):
-                for w in nodes(v):
-                    if w not in ignore_nodes:
-                        yield w
-            return iterate
-
-        Gsucc = filter_iter(Gsucc)
-
-    # Support optional edges filter
-    if ignore_edges:
-        def filter_succ_iter(succ_iter):
-            def iterate(v):
-                for w in succ_iter(v):
-                    if (w, v) not in ignore_edges:  # Reversed as ignore_edges is real src to real dest
-                        yield w
-            return iterate
-
-        Gsucc = filter_succ_iter(Gsucc)
 
     push = heappush
     pop = heappop
@@ -869,6 +922,10 @@ def _dijkstra_reverse(G, source, target, initial_amnt, ignore_nodes=None, ignore
             # No fees on last hop
             cost = 0 if v == source else weight(G[w][v], paths[v][1] + initial_amnt)
             vw_dist = dist[v] + cost
+
+            if avoid_edges and (w, v) in avoid_edges:
+                vw_dist += 1000  # Bump up cost to avoid these edges
+
             if w not in seen or vw_dist < seen[w]:
                 # Add or update if new shortest distance from src -> u
                 # But only if the path "supports" the amnt with fees
@@ -885,6 +942,76 @@ def _dijkstra_reverse(G, source, target, initial_amnt, ignore_nodes=None, ignore
         # No path found
         return False
 
+def _bfs_reverse(G, source, target, initial_amnt, avoid_edges=None):
+    """Find a path from source to target, starting the search from the target towards source.
+
+    Only supports directed graph.
+
+    Constaint: path must be able to support amnt with compounded fees.
+
+    Uses the breatdh first search algorithm.
+
+    Args:
+        G: NetworkX graph in use.
+        source: (Node) source node.
+        target: (Node) destination node.
+        initial_amnt: (float) amnt of satoshi intended to be transferred on the last hop to the target.
+        avoid_edges: (list<Node>) when path finding, increase weight of these edges to avoid.
+
+    Returns:
+        the length of the shortest hop path found, using the given weight function and,
+        the corresponding shortest hop path found.
+    """
+    source, target = target, source  # Search from target instead
+
+    # Weight - Fee calculation on directed edge for a given amnt
+    weight = lambda d, amnt: d["fees"][0] + d["fees"][1] * amnt
+
+    Gsucc = G.successors
+
+    push = heappush
+    pop = heappop
+    dist = {}  # Dictionary of final distances
+    seen = {}
+    paths = {source: ([source], 0)}
+
+    # Fringe is heapq with 3-tuples (const 1, c, node, distance)
+    # Use the count c to avoid comparing nodes (may not be able to)
+    c = count()
+    fringe = []
+
+    seen[source] = 0
+    push(fringe, (1, next(c), source, 0))
+
+    while fringe:
+        (_, _, v, d) = pop(fringe)
+        if v in dist:
+            continue  # Already searched this node.
+        dist[v] = d
+        if v == target:
+            break
+        for w in Gsucc(v):
+            # No fees on last hop
+            cost = 0 if v == source else weight(G[w][v], paths[v][1] + initial_amnt)
+            vw_dist = dist[v] + cost
+            # if avoid_edges and (w, v) in avoid_edges:
+            #     cost += 1000  # Bump up cost to avoid these edges
+
+            if w not in seen:
+                # Add or update if new shortest distance from src -> u
+                # But only if the path "supports" the amnt with fees
+                # If this is the last hop, we know the equity at one side of the channel
+                if (w == target and cost + initial_amnt <= G[w][v]["equity"]) or \
+                    (w != target and cost + initial_amnt <= G[w][v]["equity"] + G[v][w]["equity"]):
+                    seen[w] = vw_dist
+                    push(fringe, (1, next(c), w, vw_dist))
+                    paths[w] = (paths[v][0] + [w], cost)
+    if target in dist:
+        # Reverse the path!
+        return dist[target], paths[target][0][::-1]
+    else:
+        # No path found
+        return False
 
 """
 //////////
@@ -907,8 +1034,8 @@ def init_random_node(i):
 
 def generate_edge_args():
     """Generate random equity and fee distribution arguments for a new pair of edges. """
-    amnt_a = np.random.choice([8500000, 500000], 1, p=[0.2, 0.8])[0]
-    amnt_b = np.random.choice([8500000, 500000], 1, p=[0.2, 0.8])[0]
+    amnt_a = np.random.choice([8000000, 500000], 1, p=[0.2, 0.8])[0]
+    amnt_b = np.random.choice([8000000, 500000], 1, p=[0.2, 0.8])[0]
 
     dir_a = [amnt_a, [1, 0.000001]]  # Default fees, also LN median
     dir_b = [amnt_b, [1, 0.000001]]
@@ -1073,18 +1200,31 @@ def select_payment_nodes(consumers, merchants, total_freqs):
 
 def select_pay_amnt(G, node):
     """Returns an appropriate spend amount (satoshi) for the selected node."""
-    max_amnt = 500000 #node.get_largest_outgoing_equity(G)
+    max_amnt = 800000
 
-    # return np.random.randint(1, max_amnt + 1)
+    return np.random.randint(1, max_amnt + 1)
     # multiplier = np.random.choice([0.2, 0.4, 0.6, 0.8], 1, [0.8, 0.05, 0.05, 0.05])[0]
     # return floor(max_amnt * multiplier)
-    return 60000
 
-def simulator():
+def simulator(max_multiplier, in_flight=100, rb=0.0, k=1):
     """Main simulator calling function. """
+    global success_count
+    global fail_count
+
+    global ROLE_BIAS
+    ROLE_BIAS = rb
+
     start_time = time.time()
-    G, pairs = generate_wattz_strogatz(NUM_NODES, 10, 0.3)
-    # G, pairs = generate_barabasi_albert(NUM_NODES, 5)
+    # G, pairs = generate_wattz_strogatz(NUM_NODES, 10, 0.3)
+    G, pairs = generate_barabasi_albert(NUM_NODES, 5)
+
+    print("max_amnt", max_multiplier * 100000)
+    print("num in flight", in_flight)
+    print("role bias", ROLE_BIAS)
+
+    start_unbalance = calc_g_unbalance(G, pairs)
+    print(start_unbalance)
+
     nodes = list(G)
 
     # nx.draw(G)
@@ -1114,41 +1254,39 @@ def simulator():
     if DEBUG: print("// INIT NUM_STARTING_PAYMENTS PAYMENTS\n-------------------------")
 
     sent_payments = 0
-
-    for i in range(NUM_STARTING_PAYMENTS):
-        selected = select_payment_nodes(consumers, merchants, total_freqs)
-
-        while selected[0] == selected[1]:
-            selected = select_payment_nodes(consumers, merchants, total_freqs)
-
-        amnt = select_pay_amnt(G, selected[0])
-        selected[0].init_payment(G, selected[1], amnt, node_comm)
-        sent_payments += 1
+    last_success = 0
 
     if DEBUG: print("// SIMULATION LOOP BEGIN\n-------------------------")
 
-    total_payments_sent = NUM_STARTING_PAYMENTS
-
     while True:
-        if success_count + fail_count >= TOTAL_TO_SEND:
-            break
+        try:
+            if success_count + fail_count >= TOTAL_TO_SEND:
+                break
 
-        if (success_count + fail_count) % RESEND_FREQ == 0:
-            print("# successful payments:", success_count)
-            print("# failed payments:", fail_count)
+            for node in nodes:
+                if success_count + fail_count >= TOTAL_TO_SEND:
+                    break
 
-            for i in range(NUM_TO_RESEND):
-                selected = select_payment_nodes(consumers, merchants, total_freqs)
+                # print(sent_payments, success_count, fail_count)
 
-                while selected[0] == selected[1]:
+                if success_count > 0 and (success_count + fail_count) % 1000 == 0 and success_count != last_success:
+                    last_success = success_count
+                    print("# successful, failed, throughput:", success_count, fail_count, success_count / (success_count + fail_count))
+                    print("# in-flight payments:", sent_payments - success_count - fail_count)
+
+                if (sent_payments - success_count - fail_count) <= in_flight:  # In-flight
                     selected = select_payment_nodes(consumers, merchants, total_freqs)
 
-                amnt = select_pay_amnt(G, selected[0])
+                    while selected[0] == selected[1]:
+                        selected = select_payment_nodes(consumers, merchants, total_freqs)
 
-                selected[0].init_payment(G, selected[1], amnt, node_comm)
-                sent_payments += 1
-        try:
-            for node in nodes:
+                    # amnt = select_pay_amnt(G, selected[0])
+                    max_amnt = max_multiplier * 100000
+                    amnt = np.random.randint(1, max_amnt + 1)
+
+                    selected[0].init_payment(G, selected[1], amnt, node_comm, k=k)
+                    sent_payments += 1
+
                 for _ in range(G.in_degree(node)):
                     node.process_next_packet(G, node_comm)
         except KeyboardInterrupt:
@@ -1159,7 +1297,17 @@ def simulator():
     print("# failed payments:", fail_count)
     print("# amp retries:", amp_retry_count)
 
+    new_unbalance = calc_g_unbalance(G, pairs)
+    print(new_unbalance)
+    print((new_unbalance - start_unbalance) * 100)
+
+    print("Avg path hops", total_path_hops / total_paths_found)
+
     print(time.time() - start_time)
+
+    # Reset
+    success_count = 0
+    fail_count = 0
 
 """
 //////////////////////////
@@ -1436,7 +1584,9 @@ def test_func():
     assert G[nodes[0]][nodes[1]]["equity"] == e_0_1 - 5
     assert G[nodes[1]][nodes[0]]["equity"] == e_1_0 + 5
 
-simulator()
+for max_amnt in [1, 2, 3, 4, 5]:
+    for k in [1, 2, 3]:
+        simulator(max_amnt, 100, k=k)
 
-if __name__ == "__main__":
-    test_func()
+# if __name__ == "__main__":
+    # test_func()
