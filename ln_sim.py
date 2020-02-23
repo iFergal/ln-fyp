@@ -686,7 +686,8 @@ class Node:
         total_paths_found += 1
 
         if len(path) - 1 > MAX_HOPS:
-            if debug: print(bcolours.FAIL + "Error: path exceeds max-hop distance" + (" [%d]" % subpayment[1] if subpayment else "") + bcolours.ENDC)
+            if debug: print(bcolours.FAIL + "Error: path exceeds max-hop distance. (%d)" % (len(path) - 1) + (" [%d]" % subpayment[1] if subpayment else "") + bcolours.ENDC)
+            fail_count += 1
             if subpayment: self._amp_out[id][0][i].append(path)
             return False
 
@@ -942,27 +943,28 @@ def _dijkstra_reverse(G, source, target, initial_amnt, avoid_edges=None):
         # No path found
         return False
 
-def _bfs_reverse(G, source, target, initial_amnt, avoid_edges=None):
+def _jit_dijsktra_reverse(G, source, jit_target, initial_amnt):
     """Find a path from source to target, starting the search from the target towards source.
 
-    Only supports directed graph.
+    This is for finding JIT routing.
+
+    The actual target here is the source (cycle), but target should be the last other node.
 
     Constaint: path must be able to support amnt with compounded fees.
 
-    Uses the breatdh first search algorithm.
+    Uses Dijkstra's algorithm and the following is adapted from NetworkX src code.
 
     Args:
         G: NetworkX graph in use.
         source: (Node) source node.
-        target: (Node) destination node.
+        jit_target: (Node) destination node.
         initial_amnt: (float) amnt of satoshi intended to be transferred on the last hop to the target.
-        avoid_edges: (list<Node>) when path finding, increase weight of these edges to avoid.
 
     Returns:
-        the length of the shortest hop path found, using the given weight function and,
-        the corresponding shortest hop path found.
+        the length of the shortest path found, using the given weight function and,
+        the corresponding shortest path found.
     """
-    source, target = target, source  # Search from target instead
+    # Source is "source" and "destination" - first hop must be jit_target (reversed).
 
     # Weight - Fee calculation on directed edge for a given amnt
     weight = lambda d, amnt: d["fees"][0] + d["fees"][1] * amnt
@@ -975,36 +977,129 @@ def _bfs_reverse(G, source, target, initial_amnt, avoid_edges=None):
     seen = {}
     paths = {source: ([source], 0)}
 
-    # Fringe is heapq with 3-tuples (const 1, c, node, distance)
+    # Fringe is heapq with 3-tuples (distance, c, node)
     # Use the count c to avoid comparing nodes (may not be able to)
     c = count()
     fringe = []
 
     seen[source] = 0
-    push(fringe, (1, next(c), source, 0))
+    push(fringe, (0, next(c), source))
+
+    first_src_popped = False
 
     while fringe:
-        (_, _, v, d) = pop(fringe)
-        if v in dist:
+        (d, _, v) = pop(fringe)
+        if first_src_popped and v in dist:
             continue  # Already searched this node.
         dist[v] = d
-        if v == target:
+        if first_src_popped and v == source:  # Found cycle
             break
+        if v == source:
+            first_src_pop = True
         for w in Gsucc(v):
+            if v == source and w != jit_target:  # Needs to come from jit_target to source when reversed
+                continue
+
+            if v == jit_target and not G.has_edge(w, source):  # No cycle of len 3 exists
+                continue
+
+            if v != jit_target and v != source:  # Only go down the cycle path
+                if w != source:
+                    continue
+
             # No fees on last hop
             cost = 0 if v == source else weight(G[w][v], paths[v][1] + initial_amnt)
             vw_dist = dist[v] + cost
-            # if avoid_edges and (w, v) in avoid_edges:
-            #     cost += 1000  # Bump up cost to avoid these edges
 
-            if w not in seen:
+            if w not in seen or vw_dist < seen[w] or seen[w] == 0:
+                # Add or update if new shortest distance from src -> u
+                # But only if the path "supports" the amnt with fees
+                # If this is the first or last hop, we know the equity at one side of the channel
+                if ((w == jit_target or w == source) and cost + initial_amnt <= G[w][v]["equity"]) or \
+                    (cost + initial_amnt <= G[w][v]["equity"] + G[v][w]["equity"]):
+                    seen[w] = vw_dist
+                    push(fringe, (vw_dist, next(c), w))
+                    paths[w] = (paths[v][0] + [w], cost)
+    if source in dist:
+        # Reverse the path!
+        return dist[source], paths[source][0][::-1]
+    else:
+        # No path found
+        return False
+
+def _slack_based_reverse(G, source, target, initial_amnt):
+    """Find a path from source to target, starting the search from the target towards source.
+
+    Only supports directed graph.
+
+    Constaint: path must be able to support amnt with compounded fees.
+
+    Uses Dijkstra's algorithm and the following is adapted from NetworkX src code,
+    but the weights are based on "slack" on channels, where path finding prefers
+    routes whose total channel balances exceed the send amnt the most.
+
+    Args:
+        G: NetworkX graph in use.
+        source: (Node) source node.
+        target: (Node) destination node.
+        initial_amnt: (float) amnt of satoshi intended to be transferred on the last hop to the target.
+
+    Returns:
+        the length of the shortest path found, using the given weight function and,
+        the corresponding shortest path found.
+    """
+    source, target = target, source  # Search from target instead
+
+    # Weight - Fee calculation on directed edge for a given amnt,
+    # to know what paths we can travel down.
+    fees_weight = lambda d, amnt: d["fees"][0] + d["fees"][1] * amnt
+
+    Gsucc = G.successors
+
+    push = heappush
+    pop = heappop
+    slacks = {}  # Dictionary of values relating to slack in path so far
+    dist = {}  # Dictionary of distances so far
+    seen = {}
+    paths = {source: ([source], 0)}
+
+    # Fringe is heapq with 5-tuples (slack val, c, node, distance, prev node in path len path)
+    # Use the count c to avoid comparing nodes (may not be able to)
+    c = count()
+    fringe = []
+
+    seen[source] = 0
+    push(fringe, (0, next(c), source, 0, None, 0))
+
+    while fringe:
+        (slack_val, _, v, d, prev_node, len_path) = pop(fringe)
+        if v in slacks:
+            continue  # Already searched this node.
+        slacks[v] = slack_val
+        dist[v] = d
+        if v == target:
+            continue
+        for w in Gsucc(v):
+            if w == prev_node:  # Don't back-track directly
+                continue
+            # No fees on last hop
+            cost = 0 if v == source else fees_weight(G[w][v], paths[v][1] + initial_amnt)
+            vw_dist = dist[v] + cost
+
+            vw_slack = (G[w][v]["equity"] + G[v][w]["equity"]) - (vw_dist + initial_amnt)
+            new_slack_val = (len_path**2 * slack_val + vw_slack) / ((len_path + 1)**2)
+            # if avoid_edges and (w, v) in avoid_edges:
+            #     vw_dist += 1000  # Bump up cost to avoid these edges
+
+            if w not in seen or new_slack_val > seen[w]:
                 # Add or update if new shortest distance from src -> u
                 # But only if the path "supports" the amnt with fees
                 # If this is the last hop, we know the equity at one side of the channel
                 if (w == target and cost + initial_amnt <= G[w][v]["equity"]) or \
                     (w != target and cost + initial_amnt <= G[w][v]["equity"] + G[v][w]["equity"]):
-                    seen[w] = vw_dist
-                    push(fringe, (1, next(c), w, vw_dist))
+                    seen[w] = new_slack_val
+                    # Negated so max heap instead of min heap - want highest slack
+                    push(fringe, (new_slack_val, next(c), w, cost, v, len_path + 1))
                     paths[w] = (paths[v][0] + [w], cost)
     if target in dist:
         # Reverse the path!
@@ -1037,8 +1132,14 @@ def generate_edge_args():
     amnt_a = np.random.choice([8000000, 500000], 1, p=[0.2, 0.8])[0]
     amnt_b = np.random.choice([8000000, 500000], 1, p=[0.2, 0.8])[0]
 
-    dir_a = [amnt_a, [1, 0.000001]]  # Default fees, also LN median
-    dir_b = [amnt_b, [1, 0.000001]]
+    base_fee_a = np.random.choice([0, 1, 2], 1, p=[0.0, 1.0, 0.0])[0]
+    base_fee_b = np.random.choice([0, 1, 2], 1, p=[0.0, 1.0, 0.0])[0]
+
+    fee_rate_a = base_fee_a * 0.000001
+    fee_rate_b = base_fee_b * 0.000001
+
+    dir_a = [amnt_a, [base_fee_a, fee_rate_a]]  # Default fees, also LN median
+    dir_b = [amnt_b, [base_fee_b, fee_rate_b]]
 
     return [dir_a, dir_b]
 
@@ -1318,6 +1419,33 @@ CORE FUNCTIONALITY TESTING
 def test_func():
     TEST_DEBUG = False
 
+    G = nx.DiGraph()
+    nodes = [Node(i, False, 0, 0, 0, 0) for i in range(5)]
+
+    G.add_edge(nodes[0], nodes[1], equity=20, fees=[1, 0.0])
+    G.add_edge(nodes[1], nodes[0], equity=10, fees=[1, 0.0])
+
+    G.add_edge(nodes[0], nodes[2], equity=20, fees=[1, 0.0])
+    G.add_edge(nodes[2], nodes[0], equity=10, fees=[1, 0.0])
+
+    G.add_edge(nodes[1], nodes[2], equity=20, fees=[1, 0.0])
+    G.add_edge(nodes[2], nodes[1], equity=10, fees=[1, 0.0])
+
+    G.add_edge(nodes[0], nodes[3], equity=20, fees=[0.1, 0.0])
+    G.add_edge(nodes[3], nodes[0], equity=10, fees=[0.1, 0.0])
+
+    G.add_edge(nodes[3], nodes[4], equity=20, fees=[0.1, 0.0])
+    G.add_edge(nodes[4], nodes[3], equity=20, fees=[0.1, 0.0])
+
+    G.add_edge(nodes[1], nodes[4], equity=20, fees=[0.1, 0.0])
+    G.add_edge(nodes[4], nodes[1], equity=10, fees=[0.1, 0.0])
+
+    cost, path = _jit_dijsktra_reverse(G, nodes[0], nodes[1], 10)
+    print(cost)
+    for p in path: print(p)
+
+    return
+
     ################## func: _dijkstra_reverse ###########
     if TEST_DEBUG: print("// PATH FINDING\n-------------------------")
 
@@ -1584,9 +1712,9 @@ def test_func():
     assert G[nodes[0]][nodes[1]]["equity"] == e_0_1 - 5
     assert G[nodes[1]][nodes[0]]["equity"] == e_1_0 + 5
 
-for max_amnt in [1, 2, 3, 4, 5]:
-    for k in [1, 2, 3]:
-        simulator(max_amnt, 100, k=k)
+for in_flight in [100]:#[10, 100, 500, 1000, 2000, 3000, 4000, 5000, 6000, 7000]:
+    # for k in [4, 5]:
+    simulator(2, in_flight, k=1)
 
 # if __name__ == "__main__":
     # test_func()
