@@ -36,7 +36,11 @@ AMP_RESEND = False  # Retry flag for AMP payments
 JIT_ROUTING = False
 JIT_RESERVE = False
 JIT_REPEAT_REBALANCE = True
-JIT_FULL_KNOWLEDGE = False
+JIT_FULL_KNOWLEDGE = True
+
+FEE_BALANCING = False
+FEE_BALANCING_CHECKPOINT = 1
+FEE_BALANCING_UPDATE_POINT = 0.2
 
 MAX_HOPS = 20  # LN standard
 AMP_TIMEOUT = 60  # 60 seconds in c-lightning
@@ -227,6 +231,14 @@ class Node:
     def get_queue(self):
         return self._queue
 
+    def get_queue_top_ts(self):
+        try:
+            top_p = self._queue.get(False)
+            self._queue.put(top_p)
+            return top_p.get_timestamp()
+        except Empty:
+            return inf
+
     def receive_packet(self, packet, debug=DEBUG):
         """Receive a packet from the main node communicator.
 
@@ -410,6 +422,8 @@ class Node:
 
                                 if debug: print("Sending pay_htlc message to node communicator from %s (-> %s)." % (self, dest) + (" [%d]" % subpayment[1] if subpayment else ""))
                                 node_comm.send_packet(self, dest, p)
+
+                                G[self][dest]["fee_metrics"][1] += 1  # Sent payment on down this edge, record
                             else:
                                 # If JIT routing is turned on, try to rebalance.
                                 found_jit_route = False
@@ -543,6 +557,26 @@ class Node:
                         node_comm.send_packet(self, original_dest, original_p)
 
                 if index != 0:  # Send cancel message on
+                    G[self][dest]["fee_metrics"][2] += 1  # Record fail coming back from payment relayed on
+
+                    # Check metrics and adjust fee rate accordingly
+                    if FEE_BALANCING and G[self][dest]["fee_metrics"][1] > FEE_BALANCING_CHECKPOINT:
+                        fail_return = G[self][dest]["fee_metrics"][2] / G[self][dest]["fee_metrics"][1]
+                        old = G[self][dest]["fee_metrics"][0]
+                        if old is not None:
+                            diff = fail_return - old
+                            if diff < -FEE_BALANCING_UPDATE_POINT:  # Too high, increase
+                                print("REDUCING")
+                                fees = G[self][dest]["fees"]
+                                if fees[0] > 0.0: fees[0] -= 0.1
+                                if fees[1] > 0.0: fees[1] -= 0.0000001
+                            elif diff > FEE_BALANCING_UPDATE_POINT:
+                                print("INCREASING")
+                                fees = G[self][dest]["fees"]
+                                fees[0] += 0.1
+                                fees[1] += 0.0000001
+                        G[self][dest]["fee_metrics"] = [fail_return, 0, 0]  # Re-init
+
                     dest = p.get_node(index - 1)
                     p.set_timestamp(time.time() + dest.get_decryption_delay())
 
@@ -579,6 +613,9 @@ class Node:
                     if not p.get_jit_id(): fail_count += 1
         except Empty:
             if debug and False: print(bcolours.WARNING + "No packets to process at %s." % self + bcolours.ENDC)
+
+    def __lt__(self, other):
+        return other
 
     def clear_old_amps(self, G, node_comm, force=False, debug=DEBUG):
         """Check for timed out AMP payments with partial subpayments that need
@@ -829,8 +866,10 @@ class Node:
 
         if len(path) - 1 > MAX_HOPS:
             if debug: print(bcolours.FAIL + "Error: path exceeds max-hop distance. (%d)" % (len(path) - 1) + (" [%d]" % subpayment[1] if subpayment else "") + bcolours.ENDC)
-            fail_count += 1
-            if subpayment: self._amp_out[id][0][i].append(path)
+            if subpayment:
+                self._amp_out[id][0][i].append(path)
+            else:
+                fail_count += 1
             return False
 
         send_amnts = calc_path_fees(G, path, amnt)
@@ -863,6 +902,8 @@ class Node:
             test_mode: (boolean) True if running from test function.
             debug: (boolean) True to display debug print statements.
         """
+        global fail_count
+
         if k == 1:
             self._init_payment(G, dest, amnt, node_comm, False, test_mode=test_mode, debug=debug)
         else:  # AMP
@@ -875,6 +916,9 @@ class Node:
             self._amp_out[id] = [subp_statuses, ttl, True]  # True here means hasn't failed yet
 
             routes = [p for p in self._find_path(G, dest, amnt / k, [], k=k)]
+
+            if k > 1 and len(routes) != k:  # AMP
+                fail_count += 1
 
             # Send off each subpayment - first attempt.
             for i in range(k):
@@ -1333,8 +1377,8 @@ def generate_wattz_strogatz(n, k, p, seed=None, test=False):
                 G.add_edge(pair[1], pair[0], equity=10, fees=[0.1, 0.005])
             else:
                 args = generate_edge_args()
-                G.add_edge(pair[0], pair[1], equity=args[0][0], fees=args[0][1])
-                G.add_edge(pair[1], pair[0], equity=args[1][0], fees=args[1][1])
+                G.add_edge(pair[0], pair[1], equity=args[0][0], fees=args[0][1], fee_metrics=[None, 0, 0])
+                G.add_edge(pair[1], pair[0], equity=args[1][0], fees=args[1][1], fee_metrics=[None, 0, 0])
             edge_pairs.add((pair[0], pair[1]))
 
     # Rewire edges from each node
@@ -1361,8 +1405,8 @@ def generate_wattz_strogatz(n, k, p, seed=None, test=False):
                         G.add_edge(w, u, equity=10, fees=[0.1, 0.005])
                     else:
                         args = generate_edge_args()
-                        G.add_edge(u, w, equity=args[0][0], fees=args[0][1])
-                        G.add_edge(w, u, equity=args[1][0], fees=args[1][1])
+                        G.add_edge(u, w, equity=args[0][0], fees=args[0][1], fee_metrics=[None, 0, 0])
+                        G.add_edge(w, u, equity=args[1][0], fees=args[1][1], fee_metrics=[None, 0, 0])
                     edge_pairs.add((u, w))
     return G, edge_pairs
 
@@ -1406,8 +1450,8 @@ def generate_barabasi_albert(n, m, seed=None):
         pairs = list(zip([src_node] * m, targets))
         for pair in pairs:
             args = generate_edge_args()
-            G.add_edge(pair[0], pair[1], equity=args[0][0], fees=args[0][1])
-            G.add_edge(pair[1], pair[0], equity=args[1][0], fees=args[1][1])
+            G.add_edge(pair[0], pair[1], equity=args[0][0], fees=args[0][1], fee_metrics=[None, 0, 0])
+            G.add_edge(pair[1], pair[0], equity=args[1][0], fees=args[1][1], fee_metrics=[None, 0, 0])
 
             edge_pairs.add((pair[0], pair[1]))
 
@@ -1455,7 +1499,7 @@ def select_pay_amnt(G, node):
     # multiplier = np.random.choice([0.2, 0.4, 0.6, 0.8], 1, [0.8, 0.05, 0.05, 0.05])[0]
     # return floor(max_amnt * multiplier)
 
-def simulator(max_multiplier, in_flight=100, rb=0.0, k=1, wa=True):
+def simulator(max_multiplier, send_timing, rb=0.0, k=1, ws=True):
     """Main simulator calling function. """
     global success_count
     global fail_count
@@ -1465,15 +1509,15 @@ def simulator(max_multiplier, in_flight=100, rb=0.0, k=1, wa=True):
 
     start_time = time.time()
 
-    if wa:
+    if ws:
         G, pairs = generate_wattz_strogatz(NUM_NODES, 10, 0.3)
-        print("WA")
+        print("WS")
     else:
         G, pairs = generate_barabasi_albert(NUM_NODES, 5)
         print("BA")
 
     print("max_amnt:", max_multiplier * 100000)
-    print("# in flight:", in_flight)
+    print("Timing:", send_timing)
     print("role bias:", ROLE_BIAS)
     print("k [AMP]:", k)
     print("JIT: [%s (repeat: %s // full knowledge: %s)]" % (JIT_ROUTING, JIT_REPEAT_REBALANCE, JIT_FULL_KNOWLEDGE))
@@ -1507,44 +1551,70 @@ def simulator(max_multiplier, in_flight=100, rb=0.0, k=1, wa=True):
     # Need to decide how to split up payments - trial & error.
     # Question: do we avoid selecting src_nodes that can't send money or count that as failure?
 
-    if DEBUG: print("// INIT NUM_STARTING_PAYMENTS PAYMENTS\n-------------------------")
-
     sent_payments = 0
     last_success = 0
 
     if DEBUG: print("// SIMULATION LOOP BEGIN\n-------------------------")
 
+    send_timer = time.time()
+    in_flight_tracker = 0
+    c = 0
+
+    node_queue = PriorityQueue()
+    for node in nodes:
+        node_queue.put((node.get_queue_top_ts(), node))
+
+    i = 0
+
     while True:
         try:
             if success_count + fail_count >= TOTAL_TO_SEND:
                 break
-
+            x = time.time()
             for node in nodes:
+            # try:
+                # timing, node = node_queue.get(False)
+
                 if success_count + fail_count >= TOTAL_TO_SEND:
                     break
 
-                # print(sent_payments, success_count, fail_count)
-
-                if success_count > 0 and (success_count + fail_count) % 1000 == 0 and success_count != last_success:
-                    last_success = success_count
-                    print("# successful, failed, throughput:", success_count, fail_count, success_count / (success_count + fail_count))
-                    print("# in-flight payments:", sent_payments - success_count - fail_count)
-
-                if (sent_payments - success_count - fail_count) <= in_flight:  # In-flight
-                    selected = select_payment_nodes(consumers, merchants, total_freqs)
-
-                    while selected[0] == selected[1]:
-                        selected = select_payment_nodes(consumers, merchants, total_freqs)
-
-                    # amnt = select_pay_amnt(G, selected[0])
-                    max_amnt = max_multiplier * 100000
-                    amnt = np.random.randint(1, max_amnt + 1)
-
-                    selected[0].init_payment(G, selected[1], amnt, node_comm, k=k)
-                    sent_payments += 1
+                # if success_count > 0 and (success_count + fail_count) % 1000 == 0 and success_count != last_success:
+                #     last_success = success_count
+                #     print("# successful, failed, throughput:", success_count, fail_count, success_count / (success_count + fail_count))
+                #     print("# in-flight payments:", sent_payments - success_count - fail_count)
 
                 for _ in range(G.in_degree(node)):
+                    # if (sent_payments - success_count - fail_count) <= in_flight:  # In-flight
+                    if time.time() >= send_timer:
+                        # print(sent_payments - success_count - fail_count, "in flight, about to send another...")
+                        in_flight_tracker += sent_payments - success_count - fail_count
+                        c += 1
+
+                        selected = select_payment_nodes(consumers, merchants, total_freqs)
+
+                        while selected[0] == selected[1]:
+                            selected = select_payment_nodes(consumers, merchants, total_freqs)
+
+                        # amnt = select_pay_amnt(G, selected[0])
+                        max_amnt = max_multiplier * 100000
+                        amnt = np.random.randint(1, max_amnt + 1)
+
+                        selected[0].init_payment(G, selected[1], amnt, node_comm, k=k)
+
+                        sent_payments += 1
+                        send_timer = time.time() + send_timing
                     node.process_next_packet(G, node_comm)
+
+                # Re-order heap
+                # x = time.time()
+                # node_queue = PriorityQueue()
+                # for node in nodes:
+                #     timing = node.get_queue_top_ts()
+                #     node_queue.put((node.get_queue_top_ts(), node))
+                # print(time.time() - x)
+            # except Empty:
+                # continue
+            print(time.time() - x)
         except KeyboardInterrupt:
             break
 
@@ -1552,14 +1622,15 @@ def simulator(max_multiplier, in_flight=100, rb=0.0, k=1, wa=True):
     print("# successful payments:", success_count)
     print("# failed payments:", fail_count)
     print("# amp retries:", amp_retry_count)
+    print("Avg in flight:", in_flight_tracker / c)
 
     new_unbalance = calc_g_unbalance(G, pairs)
     # print(new_unbalance)
     # print((new_unbalance - start_unbalance) * 100)
 
-    print("# Avg path hops: ", total_path_hops / total_paths_found)
+    print("# Avg path hops:", total_path_hops / total_paths_found)
 
-    # print(time.time() - start_time)
+    print("Time to run:", (time.time() - start_time) / 60)
 
     # Reset
     success_count = 0
@@ -1895,11 +1966,11 @@ def test_func():
     assert G[nodes[0]][nodes[1]]["equity"] == e_0_1 - 5
     assert G[nodes[1]][nodes[0]]["equity"] == e_1_0 + 5
 
-for i in range(1):
+for i in range(20):
     for max_amnt in [2]:
-        for in_flight in [10, 100, 1000, 3000, 5000, 7000]:
-            for k in [1]:
-                simulator(max_amnt, in_flight, k=k, wa=False)
+        for timing in [0.001]:
+            for k in [2]:
+                simulator(max_amnt, timing, k=k, ws=True)
                 print("\n\n")
 
 # if __name__ == "__main__":
