@@ -36,7 +36,7 @@ AMP_RESEND = False  # Retry flag for AMP payments
 JIT_ROUTING = False
 JIT_RESERVE = False
 JIT_REPEAT_REBALANCE = True
-JIT_FULL_KNOWLEDGE = True
+JIT_FULL_KNOWLEDGE = False
 
 FEE_BALANCING = False
 FEE_BALANCING_CHECKPOINT = 1
@@ -45,7 +45,7 @@ FEE_BALANCING_UPDATE_POINT = 0.2
 MAX_HOPS = 20  # LN standard
 AMP_TIMEOUT = 60  # 60 seconds in c-lightning
 MERCHANT_PROB = 0.67
-LATENCY_OPTIONS = [0.01, 0.1, 1]  # Sprites paper, in seconds, scaled down to 10%
+LATENCY_OPTIONS = [0.1, 1, 10]  # Sprites paper, in seconds
 LATENCY_DISTRIBUTION = [0.925, 0.049, 0.026]
 CTLV_OPTIONS = [9]  # Default on LN for now
 CTLV_DISTRIBUTION = [1]
@@ -76,6 +76,10 @@ fail_count = 0
 amp_retry_count = 0
 total_path_hops = 0
 total_paths_found = 0
+
+# Packet handling
+sim_time = 0.0
+packet_queue = PriorityQueue()
 
 """
 //////////////////
@@ -192,7 +196,7 @@ class Node:
         self._htlc_out = {}  # Maps other nodes to HTLCs
         self._jit_out = {}  # Maps JIT route IDs to payment packets (to be completed after if JIT successful)
         self._jit_reserve = {}  # Total number of equity reserved while rebalancing, mapped by out-going edges
-        self._queue = PriorityQueue()  # Packet queue
+        # self._queue = PriorityQueue()  # Packet queue
 
     def get_id(self):
         return self._id
@@ -228,16 +232,16 @@ class Node:
 
         self._htlc_out[node][id] = (amnt, ttl)
 
-    def get_queue(self):
-        return self._queue
+    # def get_queue(self):
+    #     return self._queue
 
-    def get_queue_top_ts(self):
-        try:
-            top_p = self._queue.get(False)
-            self._queue.put(top_p)
-            return top_p.get_timestamp()
-        except Empty:
-            return inf
+    # def get_queue_top_ts(self):
+    #     try:
+    #         top_p = self._queue.get(False)
+    #         self._queue.put(top_p)
+    #         return top_p.get_timestamp()
+    #     except Empty:
+    #         return inf
 
     def receive_packet(self, packet, debug=DEBUG):
         """Receive a packet from the main node communicator.
@@ -246,16 +250,20 @@ class Node:
             packet: (Packet) the packet to add to the Node's priority queue.
             debug: (boolean) True to display debug print statements.
         """
-        if debug: print(bcolours.OKGREEN + "%s is receiving packet from node communicator." % self + bcolours.ENDC)
-        self._queue.put(packet)
+        global packet_queue
 
-    def process_next_packet(self, G, node_comm, test_mode=False, debug=DEBUG):
+        if debug: print(bcolours.OKGREEN + "%s is receiving packet from node communicator." % self + bcolours.ENDC)
+        packet_queue.put((packet, self))
+        # self._queue.put(packet)
+
+    def process_packet(self, G, node_comm, p, test_mode=False, debug=DEBUG):
         """Process next packet if any.
 
         Args:
             G: NetworkX graph in use.
             debug: (boolean) True to display debug print statements.
-            node_comm: (NodeCommunicator) main communicator to send packets to.
+            node_comm: (NodeCommunicator) Main message communicator between nodes.
+            p: (Packet) Packet to process.
             test_mode: (boolean) True if running from test function.
             debug: (boolean) True to display debug print statements.
         """
@@ -264,358 +272,347 @@ class Node:
         global fail_count
         global amp_retry_count
 
-        # Need to only remove from the PriorityQueue if ready to be proccessed time-wise !
-        try:
-            p = self._queue.get(False)
+        index = p.get_index(self._id)
+        type = p.get_type()
+        amnt = p.get_amnt(index - 1)
+        subpayment = p.get_subpayment()
 
-            if time.time() < p.get_timestamp():  # Not ready to be removed, return to queue
-                self._queue.put(p)
-                # if debug: print(bcolours.WARNING + "No packets are ready to process at %s yet." % self + bcolours.ENDC)
-                return
+        # -- ORDER --
+        # Equity moves when destination node receives message from source node.
+        # HTLC equity is claimed back by source node as they receive preimage, and then sent to next.
+        # HTLCs are fully cancelled when cancel message is received by destination node.
 
-            index = p.get_index(self._id)
-            type = p.get_type()
-            amnt = p.get_amnt(index - 1)
-            subpayment = p.get_subpayment()
+        if type == "pay" or type == "pay_htlc":
+            src = p.get_node(index - 1)
 
-            # -- ORDER --
-            # Equity moves when destination node receives message from source node.
-            # HTLC equity is claimed back by source node as they receive preimage, and then sent to next.
-            # HTLCs are fully cancelled when cancel message is received by destination node.
+            jit_reserve = 0
+            if self in src.get_jit_reserve():
+                jit_reserve = src.get_jit_reserve(self)
 
-            if type == "pay" or type == "pay_htlc":
-                src = p.get_node(index - 1)
+            # Assume: amnt > 0, check for available funds only
+            if G[src][self]["equity"] - jit_reserve >= amnt:
+                G[src][self]["equity"] -= amnt  # To HTLC (if not direct) or other node (if direct)
+                if type == "pay":
+                    success_count += 1
+                    G[self][src]["equity"] += amnt
+                    if debug: print("Sent %.4f from %s to %s." % (amnt, src, self) + (" [%d]" % subpayment[1] if subpayment else ""))
+                else:
+                    id = uuid4()
+                    ttl = sim_time + node_comm.get_ctlv_delta(src, self) * CLTV_MULTIPLIER
+                    src.update_htlc_out(self, id, amnt, ttl)
 
-                jit_reserve = 0
-                if self in src.get_jit_reserve():
-                    jit_reserve = src.get_jit_reserve(self)
+                    p.add_htlc_id(id)
 
-                # Assume: amnt > 0, check for available funds only
-                if G[src][self]["equity"] - jit_reserve >= amnt:
-                    G[src][self]["equity"] -= amnt  # To HTLC (if not direct) or other node (if direct)
-                    if type == "pay":
-                        success_count += 1
-                        G[self][src]["equity"] += amnt
-                        if debug: print("Sent %.4f from %s to %s." % (amnt, src, self) + (" [%d]" % subpayment[1] if subpayment else ""))
-                    else:
-                        id = uuid4()
-                        ttl = time.time() + node_comm.get_ctlv_delta(src, self) * CLTV_MULTIPLIER
-                        src.update_htlc_out(self, id, amnt, ttl)
+                    if debug: print("Sent (HTLC) %.4f from %s to %s." % (amnt, src, self) + (" [%d]" % subpayment[1] if subpayment else ""))
+                    if index == p.get_final_index():
+                        # Receiver - so release preimage back and claim funds if not AMP
+                        if not subpayment:
+                            G[self][src]["equity"] += amnt
 
-                        p.add_htlc_id(id)
+                            dest = p.get_node(index - 1)
+                            p.set_type("preimage")
+                            # p.set_timestamp(sim_time + dest.get_decryption_delay())
 
-                        if debug: print("Sent (HTLC) %.4f from %s to %s." % (amnt, src, self) + (" [%d]" % subpayment[1] if subpayment else ""))
-                        if index == p.get_final_index():
-                            # Receiver - so release preimage back and claim funds if not AMP
-                            if not subpayment:
-                                G[self][src]["equity"] += amnt
+                            if debug: print("Received payment - sending preimage release message to node communicator from %s (-> %s)." % (self, dest))
+                            node_comm.send_packet(self, dest, p)
 
-                                dest = p.get_node(index - 1)
-                                p.set_type("preimage")
-                                p.set_timestamp(time.time() + dest.get_decryption_delay())
+                            # Clear reverse
+                            if JIT_RESERVE:
+                                original_amnt = original_p.get_amnt(index)
+                                self._jit_reserve[dest] = 0
 
-                                if debug: print("Received payment - sending preimage release message to node communicator from %s (-> %s)." % (self, dest))
-                                node_comm.send_packet(self, dest, p)
+                            jit_id = p.get_jit_id()
+                            if jit_id: # Now (might be) enough funds are available after rebalance.
+                                original_p = self._jit_out[jit_id]
+                                del self._jit_out[jit_id]
 
-                                # Clear reverse
-                                if JIT_RESERVE:
-                                    original_amnt = original_p.get_amnt(index)
-                                    self._jit_reserve[dest] = 0
+                                index = original_p.get_index(self._id)
+                                dest = original_p.get_node(index + 1)
+                                amnt = original_p.get_amnt(index)
 
-                                jit_id = p.get_jit_id()
-                                if jit_id: # Now (might be) enough funds are available after rebalance.
-                                    original_p = self._jit_out[jit_id]
-                                    del self._jit_out[jit_id]
+                                # But if another payment stole the funds while rebalancing, try to rebalance again
+                                if JIT_REPEAT_REBALANCE and G[self][dest]["equity"] < amnt:
+                                    found_jit_route = False
+                                    if JIT_ROUTING and not original_p.get_jit_id():  # Don't create rebalance loops
+                                        rebalance_delta = amnt - G[self][dest]["equity"]
+                                        cost, path = _jit_dijsktra_reverse(G, self, dest, rebalance_delta)
 
-                                    index = original_p.get_index(self._id)
-                                    dest = original_p.get_node(index + 1)
-                                    amnt = original_p.get_amnt(index)
+                                        if len(path) == 4:
+                                            found_jit_route = True
+                                            jit_id = uuid4()
+                                            self._jit_out[jit_id] = original_p  # @TODO: decryption delay here too
 
-                                    # But if another payment stole the funds while rebalancing, try to rebalance again
-                                    if JIT_REPEAT_REBALANCE and G[self][dest]["equity"] < amnt:
-                                        found_jit_route = False
-                                        if JIT_ROUTING and not original_p.get_jit_id():  # Don't create rebalance loops
-                                            rebalance_delta = amnt - G[self][dest]["equity"]
-                                            cost, path = _jit_dijsktra_reverse(G, self, dest, rebalance_delta)
+                                            # Reserve equity, so another payment doesn't take it while rebalancing
+                                            if JIT_RESERVE:
+                                                if dest not in self._jit_reserve:
+                                                    self._jit_reserve[dest] = 0
 
-                                            if len(path) == 4:
-                                                found_jit_route = True
-                                                jit_id = uuid4()
-                                                self._jit_out[jit_id] = original_p  # @TODO: decryption delay here too
+                                                self._jit_reserve[dest] += G[self][dest]["equity"]
 
-                                                # Reserve equity, so another payment doesn't take it while rebalancing
-                                                if JIT_RESERVE:
-                                                    if dest not in self._jit_reserve:
-                                                        self._jit_reserve[dest] = 0
+                                            send_amnts = calc_path_fees(G, path, rebalance_delta)
+                                            index_mapping = {path[i].get_id(): i for i in range(len(path))}
+                                            index_mapping["src"] = self
 
-                                                    self._jit_reserve[dest] += G[self][dest]["equity"]
+                                            if debug: print("Attempting to rebalancing funds between %s and %s for JIT payment." % (self, path[1]))
 
-                                                send_amnts = calc_path_fees(G, path, rebalance_delta)
-                                                index_mapping = {path[i].get_id(): i for i in range(len(path))}
-                                                index_mapping["src"] = self
+                                            jit_p = Packet(path, index_mapping, send_amnts, jit_id=jit_id)
+                                            jit_p.set_timestamp(sim_time)
+                                            # jit_p.set_timestamp(sim_time + self._encryption_delay + path[1].get_decryption_delay())
 
-                                                if debug: print("Attempting to rebalancing funds between %s and %s for JIT payment." % (self, path[1]))
+                                            if debug: print("Sending %s message to node communicator from %s (-> %s)." % (type, self, path[1]) + (" [%d]" % subpayment[1] if subpayment else ""))
+                                            node_comm.send_packet(self, path[1], jit_p)
 
-                                                jit_p = Packet(path, index_mapping, send_amnts, jit_id=jit_id)
-                                                jit_p.set_timestamp(time.time() + self._encryption_delay + path[1].get_decryption_delay())
+                                    if not found_jit_route:
+                                        if debug: print(bcolours.FAIL + "Error: equity between %s and %s not available for transfer - reversing." % (self, dest) + (" [%d]" % subpayment[1] if subpayment else "") + bcolours.ENDC)
+                                        original_p.set_type("cancel")
+                                        dest = original_p.get_node(index - 1)
+                                        # original_p.set_timestamp(sim_time + dest.get_decryption_delay())
 
-                                                if debug: print("Sending %s message to node communicator from %s (-> %s)." % (type, self, path[1]) + (" [%d]" % subpayment[1] if subpayment else ""))
-                                                node_comm.send_packet(self, path[1], jit_p)
-
-                                        if not found_jit_route:
-                                            if debug: print(bcolours.FAIL + "Error: equity between %s and %s not available for transfer - reversing." % (self, dest) + (" [%d]" % subpayment[1] if subpayment else "") + bcolours.ENDC)
-                                            original_p.set_type("cancel")
-                                            dest = original_p.get_node(index - 1)
-                                            original_p.set_timestamp(time.time() + dest.get_decryption_delay())
-
-                                            node_comm.send_packet(self, dest, original_p)
-                                    else:
-                                        original_p.set_timestamp(time.time() + dest.get_decryption_delay())
-
-                                        if debug: print("Sending pay_htlc message to node communicator from %s (-> %s)." % (self, dest) + (" [%d]" % subpayment[1] if subpayment else ""))
                                         node_comm.send_packet(self, dest, original_p)
-                            else:  # If AMP, we need to keep and store all the partial payments
-                                id, subp_index, _, ttl = p.get_subpayment()
-                                if not id in self._amp_in:
-                                    self._amp_in[id] = []
+                                else:
+                                    # original_p.set_timestamp(sim_time + dest.get_decryption_delay())
 
-                                if time.time() <= ttl:  # Within time
-                                    self._amp_in[id].append(p)
-                                    if debug: print(bcolours.OKGREEN + "Received partial payment at %s. [%d]" % (self, subpayment[1]) + bcolours.ENDC)
+                                    if debug: print("Sending pay_htlc message to node communicator from %s (-> %s)." % (self, dest) + (" [%d]" % subpayment[1] if subpayment else ""))
+                                    node_comm.send_packet(self, dest, original_p)
+                        else:  # If AMP, we need to keep and store all the partial payments
+                            id, subp_index, _, ttl = p.get_subpayment()
+                            if not id in self._amp_in:
+                                self._amp_in[id] = []
 
-                                    if len(self._amp_in[id]) == subpayment[2]:  # All collected, release HTLCs
-                                        for s in self._amp_in[id]:
-                                            index = s.get_index(self._id)
-                                            dest = s.get_node(index - 1)
-                                            amnt = s.get_amnt(index - 1)
-                                            G[self][dest]["equity"] += amnt
+                            if time.time() <= ttl:  # Within time
+                                self._amp_in[id].append(p)
+                                if debug: print(bcolours.OKGREEN + "Received partial payment at %s. [%d]" % (self, subpayment[1]) + bcolours.ENDC)
 
-                                            s.set_type("preimage")
-                                            p.set_timestamp(time.time() + dest.get_decryption_delay())
-
-                                            if debug: print("Sending preimage release message to node communicator from %s (-> %s). [%d]" % (self, dest, subpayment[1]))
-                                            node_comm.send_packet(self, dest, s)
-                                        del self._amp_in[id]
-                                else:  # Out of time, need to release subpayments back
+                                if len(self._amp_in[id]) == subpayment[2]:  # All collected, release HTLCs
                                     for s in self._amp_in[id]:
                                         index = s.get_index(self._id)
                                         dest = s.get_node(index - 1)
                                         amnt = s.get_amnt(index - 1)
                                         G[self][dest]["equity"] += amnt
 
-                                        s.set_type("cancel")
-                                        p.set_timestamp(time.time() + dest.get_decryption_delay())
+                                        s.set_type("preimage")
+                                        # p.set_timestamp(sim_time + dest.get_decryption_delay())
 
-                                        if debug: print("Sending cancel message to node communicator from %s (-> %s). [%d]" % (self, dest, subpayment[1]))
+                                        if debug: print("Sending preimage release message to node communicator from %s (-> %s). [%d]" % (self, dest, subpayment[1]))
                                         node_comm.send_packet(self, dest, s)
-                        else:
-                            # Need to keep sending it on, but only if funds are available
-                            dest = p.get_node(index + 1)
-                            amnt = p.get_amnt(index)
+                                    del self._amp_in[id]
+                            else:  # Out of time, need to release subpayments back
+                                for s in self._amp_in[id]:
+                                    index = s.get_index(self._id)
+                                    dest = s.get_node(index - 1)
+                                    amnt = s.get_amnt(index - 1)
+                                    G[self][dest]["equity"] += amnt
 
-                            jit_reserve = 0
-                            if dest in self.get_jit_reserve():
-                                jit_reserve = self.get_jit_reserve(dest)
+                                    s.set_type("cancel")
+                                    # p.set_timestamp(sim_time + dest.get_decryption_delay())
 
-                            if G[self][dest]["equity"] - jit_reserve >= amnt:
-                                p.set_timestamp(time.time() + dest.get_decryption_delay())
-
-                                if debug: print("Sending pay_htlc message to node communicator from %s (-> %s)." % (self, dest) + (" [%d]" % subpayment[1] if subpayment else ""))
-                                node_comm.send_packet(self, dest, p)
-
-                                G[self][dest]["fee_metrics"][1] += 1  # Sent payment on down this edge, record
-                            else:
-                                # If JIT routing is turned on, try to rebalance.
-                                found_jit_route = False
-                                if JIT_ROUTING and not p.get_jit_id():  # Don't create rebalance loops
-                                    rebalance_delta = amnt - G[self][dest]["equity"]
-                                    cost, path = _jit_dijsktra_reverse(G, self, dest, rebalance_delta)
-
-                                    if len(path) == 4:  # Proper cycle found
-                                        found_jit_route = True
-                                        jit_id = uuid4()
-                                        self._jit_out[jit_id] = p  # @TODO: decryption delay here too
-
-                                        # Reserve equity, so another payment doesn't take it while rebalancing
-                                        if JIT_RESERVE:
-                                            if dest not in self._jit_reserve:
-                                                self._jit_reserve[dest] = 0
-
-                                            self._jit_reserve[dest] += G[self][dest]["equity"]
-
-                                        send_amnts = calc_path_fees(G, path, rebalance_delta)
-                                        index_mapping = {path[i].get_id(): i for i in range(len(path))}
-                                        index_mapping["src"] = self
-
-                                        if debug: print("Attempting to rebalancing funds between %s and %s for JIT payment." % (self, path[1]))
-
-                                        jit_p = Packet(path, index_mapping, send_amnts, jit_id=jit_id)
-                                        jit_p.set_timestamp(time.time() + self._encryption_delay + path[1].get_decryption_delay())
-
-                                        if debug: print("Sending %s message to node communicator from %s (-> %s)." % (type, self, path[1]) + (" [%d]" % subpayment[1] if subpayment else ""))
-                                        node_comm.send_packet(self, path[1], jit_p)
-
-                                if not found_jit_route:
-                                    if debug: print(bcolours.FAIL + "Error: equity between %s and %s not available for transfer - reversing." % (self, dest) + (" [%d]" % subpayment[1] if subpayment else "") + bcolours.ENDC)
-                                    p.set_type("cancel")
-                                    p.set_timestamp(time.time() + p.get_node(index - 1).get_decryption_delay())
-
-                                    node_comm.send_packet(self, p.get_node(index - 1), p)
-                else:
-                    if debug: print(bcolours.FAIL + "Error: equity between %s and %s not available for transfer." % (src, self) + (" [%d]" % subpayment[1] if subpayment else "") + bcolours.ENDC)
-
-                    dest = p.get_node(index - 1)  # Propagate back CANCEL
-                    p.set_type("cancel_rest")  # Not regular cancel as no HTLC with prev. node.
-                    p.set_timestamp(time.time() + dest.get_decryption_delay())
-
-                    if debug: print("Sending cancellation message to node communicator from %s (-> %s)." % (self, dest) + (" [%d]" % subpayment[1] if subpayment else ""))
-                    node_comm.send_packet(self, dest, p)
-            elif type == "preimage":
-                # Release HTLC entry
-                if p.get_index("src") == self:
-                    del self._htlc_out[p.get_node(1)][p.get_htlc_id(0)]
-                else:
-                    if p.get_htlc_id(index) in self._htlc_out[p.get_node(index + 1)]:  # @TODO: why is this needed
-                        del self._htlc_out[p.get_node(index + 1)][p.get_htlc_id(index)]
-
-                if index != 0 and p.get_index("src") != self:  # Keep releasing
-                    dest = p.get_node(index - 1)
-                    G[self][dest]["equity"] += amnt
-
-                    if debug:
-                        print("%s claimed back %.4f from payment from %s." % (self, amnt, dest) + (" [%d]" % subpayment[1] if subpayment else ""))
-                        print("Sending preimage release message to node communicator from %s (-> %s)." % (self, dest) + (" [%d]" % subpayment[1] if subpayment else ""))
-
-                    p.set_timestamp(time.time() + dest.get_decryption_delay())
-                    node_comm.send_packet(self, dest, p)
-                else:  # Sender, receipt come back
-                    if not subpayment and not p.get_jit_id():
-                        success_count += 1
-
-                    if debug:
-                        j = p.get_final_index()
-                        print(bcolours.OKGREEN + "Payment [%s -> %s // %.4f] successfully completed." % (self, p.get_node(j), p.get_amnt(j-1)) + (" [%d]" % subpayment[1] if subpayment else "") + bcolours.ENDC)
-
-                    if p.get_subpayment() and p.get_subpayment()[0] in self._amp_out:
-                        # Then, receiver must have got all of AMP
-                        del self._amp_out[p.get_subpayment()[0]]
-                        success_count += 1
-
-                        j = p.get_final_index()
-                        if debug: print(bcolours.OKGREEN + "AMP from %s to %s [%.4s] fully completed." % (self, p.get_node(j), p.get_amnt(j-1)) + bcolours.ENDC)
-            else:  # Cancel message
-                if p.get_index("src") == self:
-                    index = 0
-
-                dest = p.get_node(index + 1)
-                amnt = p.get_amnt(index)
-
-                if not p.is_delayed(index):
-                    cancel_chance = np.random.choice(DELAY_RESP_VAL, 1, p=DELAY_RESP_DISTRIBUTION)[0] if not test_mode else 0
-
-                    # Some unresponsive or malicious nodes might delay the cancellation
-                    if cancel_chance:
-                        # Simulate this by requeuing the Packet with an updated timestamp to open
-                        ttl = time.time() + node_comm.get_ctlv_delta(self, dest) * CLTV_MULTIPLIER * cancel_chance
-                        p.set_timestamp(ttl)
-                        p.set_delayed(index)
-                        self._queue.put(p)
-
-                        if debug: print("%s is waiting for %.4f of HTLC timeout before signing..." % (self, cancel_chance))
-                        return
-
-                if p.get_type() == "cancel":  # Not cancel_rest
-                    if p.get_htlc_id(index) in self._htlc_out[dest]:  # @TODO: why is this check required...
-                        del self._htlc_out[dest][p.get_htlc_id(index)]
-
-                    G[self][dest]["equity"] += amnt  # Claim back
-                    if debug: print("%s cancelled HTLC and claimed back %.4f from payment to %s." % (self, amnt, dest) + (" [%d]" % subpayment[1] if subpayment else ""))
-                else:
-                    p.set_type("cancel")
-
-                if index == 0:
-                    if debug:
-                        j = p.get_final_index()
-                        print(bcolours.FAIL + "Payment [%s -> %s // %.4f] failed and returned." % (self, p.get_node(j), p.get_amnt(j-1)) + (" [%d]" % subpayment[1] if subpayment else "") + bcolours.ENDC)
-                    jit_id = p.get_jit_id()
-                    if jit_id:
-                        original_p = self._jit_out[jit_id]
-                        del self._jit_out[jit_id]
-
-                        original_index = original_p.get_index(self._id)
-                        original_dest = original_p.get_node(original_index - 1)
-
-                        # Clear reserve
-                        if JIT_RESERVE:
-                            original_out_amnt = original_p.get_amnt(original_index)
-                            self._jit_reserve[original_p.get_node(original_index + 1)] = 0
-
-                        original_p.set_type("cancel")
-                        original_p.set_timestamp(time.time() + original_dest.get_decryption_delay())
-
-                        if debug: print("Sending cancel message to node communicator from %s (-> %s)." % (self, original_dest))
-                        node_comm.send_packet(self, original_dest, original_p)
-
-                if index != 0:  # Send cancel message on
-                    G[self][dest]["fee_metrics"][2] += 1  # Record fail coming back from payment relayed on
-
-                    # Check metrics and adjust fee rate accordingly
-                    if FEE_BALANCING and G[self][dest]["fee_metrics"][1] > FEE_BALANCING_CHECKPOINT:
-                        fail_return = G[self][dest]["fee_metrics"][2] / G[self][dest]["fee_metrics"][1]
-                        old = G[self][dest]["fee_metrics"][0]
-                        if old is not None:
-                            diff = fail_return - old
-                            if diff < -FEE_BALANCING_UPDATE_POINT:  # Too high, increase
-                                print("REDUCING")
-                                fees = G[self][dest]["fees"]
-                                if fees[0] > 0.0: fees[0] -= 0.1
-                                if fees[1] > 0.0: fees[1] -= 0.0000001
-                            elif diff > FEE_BALANCING_UPDATE_POINT:
-                                print("INCREASING")
-                                fees = G[self][dest]["fees"]
-                                fees[0] += 0.1
-                                fees[1] += 0.0000001
-                        G[self][dest]["fee_metrics"] = [fail_return, 0, 0]  # Re-init
-
-                    dest = p.get_node(index - 1)
-                    p.set_timestamp(time.time() + dest.get_decryption_delay())
-
-                    if debug: print("Sending cancellation message to node communicator from %s (-> %s)." % (self, dest) + (" [%d]" % subpayment[1] if subpayment else ""))
-                    node_comm.send_packet(self, dest, p)
-                elif subpayment:  # Partial payment of AMP failed
-                    # subpayment in form [ID, index, total num, ttl]
-                    id, i, k, ttl = subpayment
-
-                    if id in self._amp_out:  # Still on-going
-                        if AMP_RESEND and time.time() < ttl and self._amp_out[id][2]:
-                            # Still within time limit - so try again!
-                            # In Rusty Russell podcast - c-lightning is 60 seconds.
-                            j = p.get_final_index()
-                            self._amp_out[id][0][i].append((p.get_total_fees(), p.get_path()))
-                            new_subp = (id, i, k)
-
-                            if debug: print(bcolours.WARNING + "Resending... [%d]" % i + bcolours.ENDC)
-                            self._init_payment(G, p.get_node(j), p.get_amnt(j-1), node_comm, new_subp, test_mode=test_mode, debug=debug)
-
-                            amp_retry_count += 1
-                        else:
-                            fail_count += 1
-                            del self._amp_out[id]
-
-                            if debug:
-                                j = p.get_final_index()
-                                print(bcolours.FAIL + "Partial payment [%d] of failed AMP from %s to %s [%.4s] returned - not resending." % (i, self, p.get_node(j), p.get_amnt(j-1)) + bcolours.ENDC)
+                                    if debug: print("Sending cancel message to node communicator from %s (-> %s). [%d]" % (self, dest, subpayment[1]))
+                                    node_comm.send_packet(self, dest, s)
                     else:
+                        # Need to keep sending it on, but only if funds are available
+                        dest = p.get_node(index + 1)
+                        amnt = p.get_amnt(index)
+
+                        jit_reserve = 0
+                        if dest in self.get_jit_reserve():
+                            jit_reserve = self.get_jit_reserve(dest)
+
+                        if G[self][dest]["equity"] - jit_reserve >= amnt:
+                            # p.set_timestamp(sim_time + dest.get_decryption_delay())
+
+                            if debug: print("Sending pay_htlc message to node communicator from %s (-> %s)." % (self, dest) + (" [%d]" % subpayment[1] if subpayment else ""))
+                            node_comm.send_packet(self, dest, p)
+
+                            G[self][dest]["fee_metrics"][1] += 1  # Sent payment on down this edge, record
+                        else:
+                            # If JIT routing is turned on, try to rebalance.
+                            found_jit_route = False
+                            if JIT_ROUTING and not p.get_jit_id():  # Don't create rebalance loops
+                                rebalance_delta = amnt - G[self][dest]["equity"]
+                                cost, path = _jit_dijsktra_reverse(G, self, dest, rebalance_delta)
+
+                                if len(path) == 4:  # Proper cycle found
+                                    found_jit_route = True
+                                    jit_id = uuid4()
+                                    self._jit_out[jit_id] = p  # @TODO: decryption delay here too
+
+                                    # Reserve equity, so another payment doesn't take it while rebalancing
+                                    if JIT_RESERVE:
+                                        if dest not in self._jit_reserve:
+                                            self._jit_reserve[dest] = 0
+
+                                        self._jit_reserve[dest] += G[self][dest]["equity"]
+
+                                    send_amnts = calc_path_fees(G, path, rebalance_delta)
+                                    index_mapping = {path[i].get_id(): i for i in range(len(path))}
+                                    index_mapping["src"] = self
+
+                                    if debug: print("Attempting to rebalancing funds between %s and %s for JIT payment." % (self, path[1]))
+
+                                    jit_p = Packet(path, index_mapping, send_amnts, jit_id=jit_id)
+                                    jit_p.set_timestamp(sim_time)
+                                    # jit_p.set_timestamp(sim_time + self._encryption_delay + path[1].get_decryption_delay())
+
+                                    if debug: print("Sending %s message to node communicator from %s (-> %s)." % (type, self, path[1]) + (" [%d]" % subpayment[1] if subpayment else ""))
+                                    node_comm.send_packet(self, path[1], jit_p)
+
+                            if not found_jit_route:
+                                if debug: print(bcolours.FAIL + "Error: equity between %s and %s not available for transfer - reversing." % (self, dest) + (" [%d]" % subpayment[1] if subpayment else "") + bcolours.ENDC)
+                                p.set_type("cancel")
+                                # p.set_timestamp(sim_time + p.get_node(index - 1).get_decryption_delay())
+
+                                node_comm.send_packet(self, p.get_node(index - 1), p)
+            else:
+                if debug: print(bcolours.FAIL + "Error: equity between %s and %s not available for transfer." % (src, self) + (" [%d]" % subpayment[1] if subpayment else "") + bcolours.ENDC)
+
+                dest = p.get_node(index - 1)  # Propagate back CANCEL
+                p.set_type("cancel_rest")  # Not regular cancel as no HTLC with prev. node.
+                # p.set_timestamp(time.time() + dest.get_decryption_delay())
+
+                if debug: print("Sending cancellation message to node communicator from %s (-> %s)." % (self, dest) + (" [%d]" % subpayment[1] if subpayment else ""))
+                node_comm.send_packet(self, dest, p)
+        elif type == "preimage":
+            # Release HTLC entry
+            if p.get_index("src") == self:
+                del self._htlc_out[p.get_node(1)][p.get_htlc_id(0)]
+            else:
+                if p.get_htlc_id(index) in self._htlc_out[p.get_node(index + 1)]:  # @TODO: why is this needed
+                    del self._htlc_out[p.get_node(index + 1)][p.get_htlc_id(index)]
+
+            if index != 0 and p.get_index("src") != self:  # Keep releasing
+                dest = p.get_node(index - 1)
+                G[self][dest]["equity"] += amnt
+
+                if debug:
+                    print("%s claimed back %.4f from payment from %s." % (self, amnt, dest) + (" [%d]" % subpayment[1] if subpayment else ""))
+                    print("Sending preimage release message to node communicator from %s (-> %s)." % (self, dest) + (" [%d]" % subpayment[1] if subpayment else ""))
+
+                # p.set_timestamp(time.time() + dest.get_decryption_delay())
+                node_comm.send_packet(self, dest, p)
+            else:  # Sender, receipt come back
+                if not subpayment and not p.get_jit_id():
+                    success_count += 1
+
+                if debug:
+                    j = p.get_final_index()
+                    print(bcolours.OKGREEN + "Payment [%s -> %s // %.4f] successfully completed." % (self, p.get_node(j), p.get_amnt(j-1)) + (" [%d]" % subpayment[1] if subpayment else "") + bcolours.ENDC)
+
+                if p.get_subpayment() and p.get_subpayment()[0] in self._amp_out:
+                    # Then, receiver must have got all of AMP
+                    del self._amp_out[p.get_subpayment()[0]]
+                    success_count += 1
+
+                    j = p.get_final_index()
+                    if debug: print(bcolours.OKGREEN + "AMP from %s to %s [%.4s] fully completed." % (self, p.get_node(j), p.get_amnt(j-1)) + bcolours.ENDC)
+        else:  # Cancel message
+            if p.get_index("src") == self:
+                index = 0
+
+            dest = p.get_node(index + 1)
+            amnt = p.get_amnt(index)
+
+            # Disable for now
+            # if not p.is_delayed(index):
+            #     cancel_chance = np.random.choice(DELAY_RESP_VAL, 1, p=DELAY_RESP_DISTRIBUTION)[0] if not test_mode else 0
+            #
+            #     # Some unresponsive or malicious nodes might delay the cancellation
+            #     if cancel_chance:
+            #         # Simulate this by requeuing the Packet with an updated timestamp to open
+            #         ttl = time.time() + node_comm.get_ctlv_delta(self, dest) * CLTV_MULTIPLIER * cancel_chance
+            #         p.set_timestamp(ttl)
+            #         p.set_delayed(index)
+            #         self._queue.put(p)
+            #
+            #         if debug: print("%s is waiting for %.4f of HTLC timeout before signing..." % (self, cancel_chance))
+            #         return
+
+            if p.get_type() == "cancel":  # Not cancel_rest
+                if p.get_htlc_id(index) in self._htlc_out[dest]:  # @TODO: why is this check required...
+                    del self._htlc_out[dest][p.get_htlc_id(index)]
+
+                G[self][dest]["equity"] += amnt  # Claim back
+                if debug: print("%s cancelled HTLC and claimed back %.4f from payment to %s." % (self, amnt, dest) + (" [%d]" % subpayment[1] if subpayment else ""))
+            else:
+                p.set_type("cancel")
+
+            if index == 0:
+                if debug:
+                    j = p.get_final_index()
+                    print(bcolours.FAIL + "Payment [%s -> %s // %.4f] failed and returned." % (self, p.get_node(j), p.get_amnt(j-1)) + (" [%d]" % subpayment[1] if subpayment else "") + bcolours.ENDC)
+                jit_id = p.get_jit_id()
+                if jit_id:
+                    original_p = self._jit_out[jit_id]
+                    del self._jit_out[jit_id]
+
+                    original_index = original_p.get_index(self._id)
+                    original_dest = original_p.get_node(original_index - 1)
+
+                    # Clear reserve
+                    if JIT_RESERVE:
+                        original_out_amnt = original_p.get_amnt(original_index)
+                        self._jit_reserve[original_p.get_node(original_index + 1)] = 0
+
+                    original_p.set_type("cancel")
+                    # original_p.set_timestamp(time.time() + original_dest.get_decryption_delay())
+
+                    if debug: print("Sending cancel message to node communicator from %s (-> %s)." % (self, original_dest))
+                    node_comm.send_packet(self, original_dest, original_p)
+
+            if index != 0:  # Send cancel message on
+                G[self][dest]["fee_metrics"][2] += 1  # Record fail coming back from payment relayed on
+
+                # Check metrics and adjust fee rate accordingly
+                if FEE_BALANCING and G[self][dest]["fee_metrics"][1] > FEE_BALANCING_CHECKPOINT:
+                    fail_return = G[self][dest]["fee_metrics"][2] / G[self][dest]["fee_metrics"][1]
+                    old = G[self][dest]["fee_metrics"][0]
+                    if old is not None:
+                        diff = fail_return - old
+                        if diff < -FEE_BALANCING_UPDATE_POINT:  # Too high, increase
+                            print("REDUCING")
+                            fees = G[self][dest]["fees"]
+                            if fees[0] > 0.0: fees[0] -= 0.1
+                            if fees[1] > 0.0: fees[1] -= 0.0000001
+                        elif diff > FEE_BALANCING_UPDATE_POINT:
+                            print("INCREASING")
+                            fees = G[self][dest]["fees"]
+                            fees[0] += 0.1
+                            fees[1] += 0.0000001
+                    G[self][dest]["fee_metrics"] = [fail_return, 0, 0]  # Re-init
+
+                dest = p.get_node(index - 1)
+                # p.set_timestamp(time.time() + dest.get_decryption_delay())
+
+                if debug: print("Sending cancellation message to node communicator from %s (-> %s)." % (self, dest) + (" [%d]" % subpayment[1] if subpayment else ""))
+                node_comm.send_packet(self, dest, p)
+            elif subpayment:  # Partial payment of AMP failed
+                # subpayment in form [ID, index, total num, ttl]
+                id, i, k, ttl = subpayment
+
+                if id in self._amp_out:  # Still on-going
+                    if AMP_RESEND and time.time() < ttl and self._amp_out[id][2]:
+                        # Still within time limit - so try again!
+                        # In Rusty Russell podcast - c-lightning is 60 seconds.
+                        j = p.get_final_index()
+                        self._amp_out[id][0][i].append((p.get_total_fees(), p.get_path()))
+                        new_subp = (id, i, k)
+
+                        if debug: print(bcolours.WARNING + "Resending... [%d]" % i + bcolours.ENDC)
+                        self._init_payment(G, p.get_node(j), p.get_amnt(j-1), node_comm, new_subp, test_mode=test_mode, debug=debug)
+
+                        amp_retry_count += 1
+                    else:
+                        fail_count += 1
+                        del self._amp_out[id]
+
                         if debug:
                             j = p.get_final_index()
                             print(bcolours.FAIL + "Partial payment [%d] of failed AMP from %s to %s [%.4s] returned - not resending." % (i, self, p.get_node(j), p.get_amnt(j-1)) + bcolours.ENDC)
-                else:  # Non-subpayment failed
-                    if not p.get_jit_id(): fail_count += 1
-        except Empty:
-            if debug and False: print(bcolours.WARNING + "No packets to process at %s." % self + bcolours.ENDC)
-
-    def __lt__(self, other):
-        return other
+                else:
+                    if debug:
+                        j = p.get_final_index()
+                        print(bcolours.FAIL + "Partial payment [%d] of failed AMP from %s to %s [%.4s] returned - not resending." % (i, self, p.get_node(j), p.get_amnt(j-1)) + bcolours.ENDC)
+            else:  # Non-subpayment failed
+                if not p.get_jit_id(): fail_count += 1
 
     def clear_old_amps(self, G, node_comm, force=False, debug=DEBUG):
         """Check for timed out AMP payments with partial subpayments that need
@@ -636,7 +633,7 @@ class Node:
                     amnt = p.get_amnt(index - 1)
 
                     p.set_type("cancel")
-                    p.set_timestamp(time.time() + dest.get_decryption_delay())
+                    # p.set_timestamp(time.time() + dest.get_decryption_delay())
 
                     if debug: print("Sending cancel message to node communicator from %s (-> %s)." % (self, dest))
                     node_comm.send_packet(self, dest, p)
@@ -665,7 +662,8 @@ class Node:
             index_mapping["src"] = self
 
             p = Packet(path, index_mapping, [amnt], "pay", False)
-            p.set_timestamp(time.time() + dest.get_decryption_delay())
+            p.set_timestamp(sim_time)
+            # p.set_timestamp(time.time() + dest.get_decryption_delay())
             node_comm.send_packet(self, dest, p)
 
             if debug: print("Sending pay message to node communicator from %s (-> %s)." % (self, dest))
@@ -880,8 +878,9 @@ class Node:
 
         p = Packet(path, index_mapping, send_amnts, type,
             (subpayment[0], subpayment[1], subpayment[2], ttl) if subpayment else False)
+        p.set_timestamp(sim_time)
 
-        p.set_timestamp(time.time() + self._encryption_delay + dest.get_decryption_delay())
+        # p.set_timestamp(time.time() + self._encryption_delay + dest.get_decryption_delay())
 
         if debug: print("Sending %s message to node communicator from %s (-> %s)." % (type, self, path[1]) + (" [%d]" % subpayment[1] if subpayment else ""))
         node_comm.send_packet(self, path[1], p)
@@ -952,7 +951,7 @@ class Node:
 class NodeCommunicator:
     """Handles communication between nodes.
 
-    Messages are synced to UTC time and network latency is applied by using future timestamps.
+    Messages are synced to simulator time and network latency is applied by using future timestamps.
     Edge latencies between nodes are initialsed here.
     CTLV expiracy deltas (BOLT 7) per directed edge initialised here. (unit: number of BTC blocks)
 
@@ -999,10 +998,6 @@ class NodeCommunicator:
             return
 
         dest.receive_packet(packet, self._debug)
-
-    def record_stat(self):
-        """Placeholder method for recording stats - nodes can send when fail / success etc. """
-        pass
 
 
 def floor_msat(satoshi):
@@ -1503,6 +1498,8 @@ def simulator(max_multiplier, send_timing, rb=0.0, k=1, ws=True):
     """Main simulator calling function. """
     global success_count
     global fail_count
+    global sim_time
+    global packet_queue
 
     global ROLE_BIAS
     ROLE_BIAS = rb
@@ -1556,37 +1553,22 @@ def simulator(max_multiplier, send_timing, rb=0.0, k=1, ws=True):
 
     if DEBUG: print("// SIMULATION LOOP BEGIN\n-------------------------")
 
-    send_timer = time.time()
     in_flight_tracker = 0
     c = 0
 
-    node_queue = PriorityQueue()
-    for node in nodes:
-        node_queue.put((node.get_queue_top_ts(), node))
+    next_payment_time = 0
 
-    i = 0
-
-    while True:
+    while success_count + fail_count < TOTAL_TO_SEND:
         try:
-            if success_count + fail_count >= TOTAL_TO_SEND:
-                break
-            x = time.time()
-            for node in nodes:
-            # try:
-                # timing, node = node_queue.get(False)
+            try:
+                p, node = packet_queue.get(False)
 
-                if success_count + fail_count >= TOTAL_TO_SEND:
-                    break
+                if p.get_timestamp() <= sim_time:
+                    node.process_packet(G, node_comm, p)
+                else:  # Put it back on
+                    packet_queue.put((p, node))
 
-                # if success_count > 0 and (success_count + fail_count) % 1000 == 0 and success_count != last_success:
-                #     last_success = success_count
-                #     print("# successful, failed, throughput:", success_count, fail_count, success_count / (success_count + fail_count))
-                #     print("# in-flight payments:", sent_payments - success_count - fail_count)
-
-                for _ in range(G.in_degree(node)):
-                    # if (sent_payments - success_count - fail_count) <= in_flight:  # In-flight
-                    if time.time() >= send_timer:
-                        # print(sent_payments - success_count - fail_count, "in flight, about to send another...")
+                    if next_payment_time <= sim_time:
                         in_flight_tracker += sent_payments - success_count - fail_count
                         c += 1
 
@@ -1595,41 +1577,41 @@ def simulator(max_multiplier, send_timing, rb=0.0, k=1, ws=True):
                         while selected[0] == selected[1]:
                             selected = select_payment_nodes(consumers, merchants, total_freqs)
 
-                        # amnt = select_pay_amnt(G, selected[0])
                         max_amnt = max_multiplier * 100000
                         amnt = np.random.randint(1, max_amnt + 1)
 
                         selected[0].init_payment(G, selected[1], amnt, node_comm, k=k)
 
                         sent_payments += 1
-                        send_timer = time.time() + send_timing
-                    node.process_next_packet(G, node_comm)
+                        next_payment_time += send_timing
 
-                # Re-order heap
-                # x = time.time()
-                # node_queue = PriorityQueue()
-                # for node in nodes:
-                #     timing = node.get_queue_top_ts()
-                #     node_queue.put((node.get_queue_top_ts(), node))
-                # print(time.time() - x)
-            # except Empty:
-                # continue
-            print(time.time() - x)
+                    sim_time = min(p.get_timestamp(), next_payment_time)
+            except:  # Jump to next sending of a payment
+                in_flight_tracker += sent_payments - success_count - fail_count
+                c += 1
+
+                selected = select_payment_nodes(consumers, merchants, total_freqs)
+
+                while selected[0] == selected[1]:
+                    selected = select_payment_nodes(consumers, merchants, total_freqs)
+
+                max_amnt = max_multiplier * 100000
+                amnt = np.random.randint(1, max_amnt + 1)
+
+                selected[0].init_payment(G, selected[1], amnt, node_comm, k=k)
+
+                sent_payments += 1
+                next_payment_time += send_timing
         except KeyboardInterrupt:
             break
+
 
     print("// ANALYTICS\n-------------------------")
     print("# successful payments:", success_count)
     print("# failed payments:", fail_count)
     print("# amp retries:", amp_retry_count)
     print("Avg in flight:", in_flight_tracker / c)
-
-    new_unbalance = calc_g_unbalance(G, pairs)
-    # print(new_unbalance)
-    # print((new_unbalance - start_unbalance) * 100)
-
     print("# Avg path hops:", total_path_hops / total_paths_found)
-
     print("Time to run:", (time.time() - start_time) / 60)
 
     # Reset
@@ -1643,7 +1625,10 @@ CORE FUNCTIONALITY TESTING
 """
 
 def test_func():
+    global sim_time
     TEST_DEBUG = False
+
+    sim_time = 0
 
     G = nx.DiGraph()
     nodes = [Node(i, False, 0, 0, 0, 0) for i in range(6)]
@@ -1672,31 +1657,21 @@ def test_func():
     node_comm_test = NodeCommunicator(nodes, edge_pairs, test_mode=True, debug=TEST_DEBUG)
 
     nodes[3]._init_payment(G, nodes[4], 10, node_comm_test)
-    nodes[0].process_next_packet(G, node_comm_test)
+
+    p, node = packet_queue.get(False)
+
+    if p.get_timestamp() <= sim_time:
+        node.process_packet(G, node_comm_test, p)
+    else:  # Put it back on
+        packet_queue.put((p, node))
 
     nodes[3]._init_payment(G, nodes[4], 5, node_comm_test)
-    nodes[0].process_next_packet(G, node_comm_test)
-    nodes[1].process_next_packet(G, node_comm_test)
-    nodes[4].process_next_packet(G, node_comm_test)
-    nodes[1].process_next_packet(G, node_comm_test)
-    nodes[0].process_next_packet(G, node_comm_test)
-    nodes[3].process_next_packet(G, node_comm_test)
-    nodes[2].process_next_packet(G, node_comm_test)
-    nodes[1].process_next_packet(G, node_comm_test)
-    nodes[0].process_next_packet(G, node_comm_test)
-    nodes[1].process_next_packet(G, node_comm_test)
-    nodes[1].process_next_packet(G, node_comm_test)
-    nodes[2].process_next_packet(G, node_comm_test)
-    nodes[1].process_next_packet(G, node_comm_test)
-    nodes[0].process_next_packet(G, node_comm_test)
-    nodes[1].process_next_packet(G, node_comm_test)
-    nodes[1].process_next_packet(G, node_comm_test)
-    nodes[4].process_next_packet(G, node_comm_test)
-    nodes[1].process_next_packet(G, node_comm_test)
-    nodes[0].process_next_packet(G, node_comm_test)
-    nodes[3].process_next_packet(G, node_comm_test)
-    nodes[2].process_next_packet(G, node_comm_test)
-    nodes[0].process_next_packet(G, node_comm_test)
+
+    while True:
+        if p.get_timestamp() <= sim_time:
+            node.process_packet(G, node_comm_test, p)
+        else:  # Put it back on
+            packet_queue.put((p, node))
 
     return
 
@@ -1968,10 +1943,11 @@ def test_func():
 
 for i in range(20):
     for max_amnt in [2]:
-        for timing in [0.001]:
-            for k in [2]:
-                simulator(max_amnt, timing, k=k, ws=True)
-                print("\n\n")
+        for timing in [0.02]:
+            for k in [1]:
+                for rb in [0.1, 0.2, 0.3, 0.4, 0.5]:
+                    simulator(max_amnt, timing, rb=rb, k=k, ws=False)
+                    print("\n\n")
 
 # if __name__ == "__main__":
     # test_func()
