@@ -24,13 +24,9 @@ CONFIGURATION
 """
 
 DEBUG = False
-NUM_NODES = 2000  # Spirtes paper uses 2k
+NUM_NODES = 2000
 NUM_TEST_NODES = 20
 TOTAL_TO_SEND = 7000
-RESEND_FREQ = 10  # How often to resend new payments (number of loops)
-NUM_TO_RESEND = 10  # Amount of payments to resend
-
-CHEAPEST_PATH = False
 
 AMP_RESEND = False  # Retry flag for AMP payments
 JIT_ROUTING = False
@@ -39,11 +35,11 @@ JIT_REPEAT_REBALANCE = True
 JIT_FULL_KNOWLEDGE = False
 
 FEE_BALANCING = False
-FEE_BALANCING_CHECKPOINT = 1
+FEE_BALANCING_CHECKPOINT = 5
 FEE_BALANCING_UPDATE_POINT = 0.2
 
-MAX_HOPS = 20  # LN standard
-AMP_TIMEOUT = 60  # 60 seconds in c-lightning
+MAX_HOPS = 20
+AMP_TIMEOUT = 60
 MERCHANT_PROB = 0.67
 LATENCY_OPTIONS = [0.1, 1, 10]  # Sprites paper, in seconds
 LATENCY_DISTRIBUTION = [0.925, 0.049, 0.026]
@@ -61,6 +57,7 @@ DECRYPTION_DELAY_DISTRIBUTION = [1]
 # Consumers pay merchants - this is the chance for different role,
 # i.e. merchant to pay or consumer to receive, [0, 0.5] - 0.5 means both as likely as each other
 ROLE_BIAS = 0.0
+HIGH_FUNDS_CHANCE = 0.2
 
 # Terminal output colours
 class bcolours:
@@ -76,6 +73,7 @@ fail_count = 0
 amp_retry_count = 0
 total_path_hops = 0
 total_paths_found = 0
+path_too_large_count = 0
 
 # Packet handling
 sim_time = 0.0
@@ -196,7 +194,6 @@ class Node:
         self._htlc_out = {}  # Maps other nodes to HTLCs
         self._jit_out = {}  # Maps JIT route IDs to payment packets (to be completed after if JIT successful)
         self._jit_reserve = {}  # Total number of equity reserved while rebalancing, mapped by out-going edges
-        # self._queue = PriorityQueue()  # Packet queue
 
     def get_id(self):
         return self._id
@@ -218,6 +215,13 @@ class Node:
             return self._jit_reserve
         return self._jit_reserve[node]
 
+    def get_htlc_out(self, node):
+        """Get HTLCs locked up with a specific node."""
+        if node in self._htlc_out:
+            return self._htlc_out[node]
+        else:
+            return None
+
     def update_htlc_out(self, node, id, amnt, ttl):
         """Neighbouring nodes can add new HTLC info when established on their channel.
 
@@ -232,17 +236,6 @@ class Node:
 
         self._htlc_out[node][id] = (amnt, ttl)
 
-    # def get_queue(self):
-    #     return self._queue
-
-    # def get_queue_top_ts(self):
-    #     try:
-    #         top_p = self._queue.get(False)
-    #         self._queue.put(top_p)
-    #         return top_p.get_timestamp()
-    #     except Empty:
-    #         return inf
-
     def receive_packet(self, packet, debug=DEBUG):
         """Receive a packet from the main node communicator.
 
@@ -254,9 +247,8 @@ class Node:
 
         if debug: print(bcolours.OKGREEN + "%s is receiving packet from node communicator." % self + bcolours.ENDC)
         packet_queue.put((packet, self))
-        # self._queue.put(packet)
 
-    def process_packet(self, G, node_comm, p, test_mode=False, debug=DEBUG):
+    def process_packet(self, G, node_comm, p, test_mode=False, amp_resend_enabled=AMP_RESEND, jit_enabled=JIT_ROUTING, debug=DEBUG):
         """Process next packet if any.
 
         Args:
@@ -293,8 +285,43 @@ class Node:
             if G[src][self]["equity"] - jit_reserve >= amnt:
                 G[src][self]["equity"] -= amnt  # To HTLC (if not direct) or other node (if direct)
                 if type == "pay":
-                    success_count += 1
-                    G[self][src]["equity"] += amnt
+                    if not subpayment:
+                        success_count += 1
+                        G[self][src]["equity"] += amnt
+                    else:
+                        id, subp_index, _, ttl = p.get_subpayment()
+                        if not id in self._amp_in:
+                            self._amp_in[id] = []
+
+                        if sim_time <= ttl:  # Within time
+                            self._amp_in[id].append(p)
+                            if debug: print(bcolours.OKGREEN + "Received partial payment at %s. [%d]" % (self, subpayment[1]) + bcolours.ENDC)
+
+                            if len(self._amp_in[id]) == subpayment[2]:  # All collected, release HTLCs
+                                for s in self._amp_in[id]:
+                                    index = s.get_index(self._id)
+                                    dest = s.get_node(index - 1)
+                                    amnt = s.get_amnt(index - 1)
+                                    G[self][dest]["equity"] += amnt
+
+                                    # Even if pay and not pay_htlc - can still send preimage, won't change anything.
+                                    s.set_type("preimage")
+                                    s.set_timestamp(sim_time + dest.get_decryption_delay())
+
+                                    if debug: print("Sending preimage release message to node communicator from %s (-> %s). [%d]" % (self, dest, subpayment[1]))
+                                    node_comm.send_packet(self, dest, s)
+                                del self._amp_in[id]
+                        else:  # Out of time, need to release subpayments back
+                            for s in self._amp_in[id]:
+                                index = s.get_index(self._id)
+                                dest = s.get_node(index - 1)
+
+                                s.set_type("cancel")
+                                s.set_timestamp(sim_time + dest.get_decryption_delay())
+
+                                if debug: print("Sending cancel message to node communicator from %s (-> %s). [%d]" % (self, dest, subpayment[1]))
+                                node_comm.send_packet(self, dest, s)
+                            del self._amp_in[id]
                     if debug: print("Sent %.4f from %s to %s." % (amnt, src, self) + (" [%d]" % subpayment[1] if subpayment else ""))
                 else:
                     id = uuid4()
@@ -333,7 +360,7 @@ class Node:
                                 # But if another payment stole the funds while rebalancing, try to rebalance again
                                 if JIT_REPEAT_REBALANCE and G[self][dest]["equity"] < amnt:
                                     found_jit_route = False
-                                    if JIT_ROUTING and not original_p.get_jit_id():  # Don't create rebalance loops
+                                    if jit_enabled and not original_p.get_jit_id():  # Don't create rebalance loops
                                         rebalance_delta = amnt - G[self][dest]["equity"]
                                         cost, path = _jit_dijsktra_reverse(G, self, dest, rebalance_delta)
 
@@ -353,7 +380,7 @@ class Node:
                                             index_mapping = {path[i].get_id(): i for i in range(len(path))}
                                             index_mapping["src"] = self
 
-                                            if debug: print("Attempting to rebalancing funds between %s and %s for JIT payment." % (self, path[1]))
+                                            if debug: print("Attempting to rebalancing funds by sending from %s to %s for JIT payment." % (self, path[1]))
 
                                             jit_p = Packet(path, index_mapping, send_amnts, jit_id=jit_id)
                                             jit_p.set_timestamp(sim_time)
@@ -366,11 +393,11 @@ class Node:
                                         if debug: print(bcolours.FAIL + "Error: equity between %s and %s not available for transfer - reversing." % (self, dest) + (" [%d]" % subpayment[1] if subpayment else "") + bcolours.ENDC)
                                         original_p.set_type("cancel")
                                         dest = original_p.get_node(index - 1)
-                                        # original_p.set_timestamp(sim_time + dest.get_decryption_delay())
+                                        original_p.set_timestamp(sim_time + dest.get_decryption_delay())
 
                                         node_comm.send_packet(self, dest, original_p)
                                 else:
-                                    # original_p.set_timestamp(sim_time + dest.get_decryption_delay())
+                                    original_p.set_timestamp(sim_time + dest.get_decryption_delay())
 
                                     if debug: print("Sending pay_htlc message to node communicator from %s (-> %s)." % (self, dest) + (" [%d]" % subpayment[1] if subpayment else ""))
                                     node_comm.send_packet(self, dest, original_p)
@@ -379,7 +406,7 @@ class Node:
                             if not id in self._amp_in:
                                 self._amp_in[id] = []
 
-                            if time.time() <= ttl:  # Within time
+                            if sim_time <= ttl:  # Within time
                                 self._amp_in[id].append(p)
                                 if debug: print(bcolours.OKGREEN + "Received partial payment at %s. [%d]" % (self, subpayment[1]) + bcolours.ENDC)
 
@@ -391,7 +418,7 @@ class Node:
                                         G[self][dest]["equity"] += amnt
 
                                         s.set_type("preimage")
-                                        # p.set_timestamp(sim_time + dest.get_decryption_delay())
+                                        s.set_timestamp(sim_time + dest.get_decryption_delay())
 
                                         if debug: print("Sending preimage release message to node communicator from %s (-> %s). [%d]" % (self, dest, subpayment[1]))
                                         node_comm.send_packet(self, dest, s)
@@ -400,14 +427,13 @@ class Node:
                                 for s in self._amp_in[id]:
                                     index = s.get_index(self._id)
                                     dest = s.get_node(index - 1)
-                                    amnt = s.get_amnt(index - 1)
-                                    G[self][dest]["equity"] += amnt
 
                                     s.set_type("cancel")
-                                    # p.set_timestamp(sim_time + dest.get_decryption_delay())
+                                    s.set_timestamp(sim_time + dest.get_decryption_delay())
 
                                     if debug: print("Sending cancel message to node communicator from %s (-> %s). [%d]" % (self, dest, subpayment[1]))
                                     node_comm.send_packet(self, dest, s)
+                                del self._amp_in[id]
                     else:
                         # Need to keep sending it on, but only if funds are available
                         dest = p.get_node(index + 1)
@@ -418,7 +444,7 @@ class Node:
                             jit_reserve = self.get_jit_reserve(dest)
 
                         if G[self][dest]["equity"] - jit_reserve >= amnt:
-                            # p.set_timestamp(sim_time + dest.get_decryption_delay())
+                            p.set_timestamp(sim_time + dest.get_decryption_delay())
 
                             if debug: print("Sending pay_htlc message to node communicator from %s (-> %s)." % (self, dest) + (" [%d]" % subpayment[1] if subpayment else ""))
                             node_comm.send_packet(self, dest, p)
@@ -427,7 +453,7 @@ class Node:
                         else:
                             # If JIT routing is turned on, try to rebalance.
                             found_jit_route = False
-                            if JIT_ROUTING and not p.get_jit_id():  # Don't create rebalance loops
+                            if jit_enabled and not p.get_jit_id():  # Don't create rebalance loops
                                 rebalance_delta = amnt - G[self][dest]["equity"]
                                 cost, path = _jit_dijsktra_reverse(G, self, dest, rebalance_delta)
 
@@ -447,11 +473,10 @@ class Node:
                                     index_mapping = {path[i].get_id(): i for i in range(len(path))}
                                     index_mapping["src"] = self
 
-                                    if debug: print("Attempting to rebalancing funds between %s and %s for JIT payment." % (self, path[1]))
+                                    if debug: print("Attempting to rebalancing funds by sending from %s to %s for JIT payment." % (self, path[1]))
 
                                     jit_p = Packet(path, index_mapping, send_amnts, jit_id=jit_id)
-                                    jit_p.set_timestamp(sim_time)
-                                    # jit_p.set_timestamp(sim_time + self._encryption_delay + path[1].get_decryption_delay())
+                                    jit_p.set_timestamp(sim_time + self._encryption_delay + path[1].get_decryption_delay())
 
                                     if debug: print("Sending %s message to node communicator from %s (-> %s)." % (type, self, path[1]) + (" [%d]" % subpayment[1] if subpayment else ""))
                                     node_comm.send_packet(self, path[1], jit_p)
@@ -459,7 +484,7 @@ class Node:
                             if not found_jit_route:
                                 if debug: print(bcolours.FAIL + "Error: equity between %s and %s not available for transfer - reversing." % (self, dest) + (" [%d]" % subpayment[1] if subpayment else "") + bcolours.ENDC)
                                 p.set_type("cancel")
-                                # p.set_timestamp(sim_time + p.get_node(index - 1).get_decryption_delay())
+                                p.set_timestamp(sim_time + p.get_node(index - 1).get_decryption_delay())
 
                                 node_comm.send_packet(self, p.get_node(index - 1), p)
             else:
@@ -467,7 +492,7 @@ class Node:
 
                 dest = p.get_node(index - 1)  # Propagate back CANCEL
                 p.set_type("cancel_rest")  # Not regular cancel as no HTLC with prev. node.
-                # p.set_timestamp(time.time() + dest.get_decryption_delay())
+                p.set_timestamp(sim_time + dest.get_decryption_delay())
 
                 if debug: print("Sending cancellation message to node communicator from %s (-> %s)." % (self, dest) + (" [%d]" % subpayment[1] if subpayment else ""))
                 node_comm.send_packet(self, dest, p)
@@ -476,7 +501,7 @@ class Node:
             if p.get_index("src") == self:
                 del self._htlc_out[p.get_node(1)][p.get_htlc_id(0)]
             else:
-                if p.get_htlc_id(index) in self._htlc_out[p.get_node(index + 1)]:  # @TODO: why is this needed
+                if p.get_htlc_id(index) in self._htlc_out[p.get_node(index + 1)]:
                     del self._htlc_out[p.get_node(index + 1)][p.get_htlc_id(index)]
 
             if index != 0 and p.get_index("src") != self:  # Keep releasing
@@ -487,7 +512,7 @@ class Node:
                     print("%s claimed back %.4f from payment from %s." % (self, amnt, dest) + (" [%d]" % subpayment[1] if subpayment else ""))
                     print("Sending preimage release message to node communicator from %s (-> %s)." % (self, dest) + (" [%d]" % subpayment[1] if subpayment else ""))
 
-                # p.set_timestamp(time.time() + dest.get_decryption_delay())
+                p.set_timestamp(sim_time + dest.get_decryption_delay())
                 node_comm.send_packet(self, dest, p)
             else:  # Sender, receipt come back
                 if not subpayment and not p.get_jit_id():
@@ -511,23 +536,23 @@ class Node:
             dest = p.get_node(index + 1)
             amnt = p.get_amnt(index)
 
-            # Disable for now
-            # if not p.is_delayed(index):
-            #     cancel_chance = np.random.choice(DELAY_RESP_VAL, 1, p=DELAY_RESP_DISTRIBUTION)[0] if not test_mode else 0
-            #
-            #     # Some unresponsive or malicious nodes might delay the cancellation
-            #     if cancel_chance:
-            #         # Simulate this by requeuing the Packet with an updated timestamp to open
-            #         ttl = time.time() + node_comm.get_ctlv_delta(self, dest) * CLTV_MULTIPLIER * cancel_chance
-            #         p.set_timestamp(ttl)
-            #         p.set_delayed(index)
-            #         self._queue.put(p)
-            #
-            #         if debug: print("%s is waiting for %.4f of HTLC timeout before signing..." % (self, cancel_chance))
-            #         return
+            if not p.is_delayed(index):
+                cancel_chance = np.random.choice(DELAY_RESP_VAL, 1, p=DELAY_RESP_DISTRIBUTION)[0] if not test_mode else 0
+
+                # Some unresponsive or malicious nodes might delay the cancellation
+                if cancel_chance:
+                    # Simulate this by requeuing the Packet with an updated timestamp to open
+                    # This isn't entirely correct - just does period of delta - possibly much larger... @TODO
+                    ttl = sim_time + node_comm.get_ctlv_delta(self, dest) * CLTV_MULTIPLIER * cancel_chance
+                    p.set_timestamp(ttl)
+                    p.set_delayed(index)
+                    self._queue.put(p)
+
+                    if debug: print("%s is waiting for %.4f of HTLC timeout before signing..." % (self, cancel_chance))
+                    return
 
             if p.get_type() == "cancel":  # Not cancel_rest
-                if p.get_htlc_id(index) in self._htlc_out[dest]:  # @TODO: why is this check required...
+                if p.get_htlc_id(index) in self._htlc_out[dest]:
                     del self._htlc_out[dest][p.get_htlc_id(index)]
 
                 G[self][dest]["equity"] += amnt  # Claim back
@@ -553,7 +578,7 @@ class Node:
                         self._jit_reserve[original_p.get_node(original_index + 1)] = 0
 
                     original_p.set_type("cancel")
-                    # original_p.set_timestamp(time.time() + original_dest.get_decryption_delay())
+                    original_p.set_timestamp(sim_time + original_dest.get_decryption_delay())
 
                     if debug: print("Sending cancel message to node communicator from %s (-> %s)." % (self, original_dest))
                     node_comm.send_packet(self, original_dest, original_p)
@@ -568,19 +593,19 @@ class Node:
                     if old is not None:
                         diff = fail_return - old
                         if diff < -FEE_BALANCING_UPDATE_POINT:  # Too high, increase
-                            print("REDUCING")
+                            # print("REDUCING")
                             fees = G[self][dest]["fees"]
                             if fees[0] > 0.0: fees[0] -= 0.1
                             if fees[1] > 0.0: fees[1] -= 0.0000001
                         elif diff > FEE_BALANCING_UPDATE_POINT:
-                            print("INCREASING")
+                            # print("INCREASING")
                             fees = G[self][dest]["fees"]
                             fees[0] += 0.1
                             fees[1] += 0.0000001
                     G[self][dest]["fee_metrics"] = [fail_return, 0, 0]  # Re-init
 
                 dest = p.get_node(index - 1)
-                # p.set_timestamp(time.time() + dest.get_decryption_delay())
+                p.set_timestamp(sim_time + dest.get_decryption_delay())
 
                 if debug: print("Sending cancellation message to node communicator from %s (-> %s)." % (self, dest) + (" [%d]" % subpayment[1] if subpayment else ""))
                 node_comm.send_packet(self, dest, p)
@@ -589,11 +614,11 @@ class Node:
                 id, i, k, ttl = subpayment
 
                 if id in self._amp_out:  # Still on-going
-                    if AMP_RESEND and time.time() < ttl and self._amp_out[id][2]:
+                    j = p.get_final_index()
+                    if amp_resend_enabled and sim_time < ttl and self._amp_out[id][2]:
                         # Still within time limit - so try again!
                         # In Rusty Russell podcast - c-lightning is 60 seconds.
-                        j = p.get_final_index()
-                        self._amp_out[id][0][i].append((p.get_total_fees(), p.get_path()))
+                        self._amp_out[id][0][i].append(p.get_path())
                         new_subp = (id, i, k)
 
                         if debug: print(bcolours.WARNING + "Resending... [%d]" % i + bcolours.ENDC)
@@ -603,6 +628,9 @@ class Node:
                     else:
                         fail_count += 1
                         del self._amp_out[id]
+
+                        # Clear stored packets
+                        p.get_node(j).clear_old_amps(G, node_comm)
 
                         if debug:
                             j = p.get_final_index()
@@ -625,7 +653,7 @@ class Node:
         """
         to_delete = []
         for id in self._amp_in:
-            if force or p.get_subpayment()[3] - time.time() < 0:
+            if force or (len(self._amp_in[id]) and self._amp_in[id][0].get_subpayment()[3] - sim_time < 0):
                 if debug: print(bcolours.WARNING + "Cancelling partial subpayments from %s for AMP ID %s" % (self, id) + bcolours.ENDC)
                 for p in self._amp_in[id]:
                     index = p.get_index(self._id)
@@ -633,7 +661,7 @@ class Node:
                     amnt = p.get_amnt(index - 1)
 
                     p.set_type("cancel")
-                    # p.set_timestamp(time.time() + dest.get_decryption_delay())
+                    p.set_timestamp(sim_time + dest.get_decryption_delay())
 
                     if debug: print("Sending cancel message to node communicator from %s (-> %s)." % (self, dest))
                     node_comm.send_packet(self, dest, p)
@@ -662,8 +690,7 @@ class Node:
             index_mapping["src"] = self
 
             p = Packet(path, index_mapping, [amnt], "pay", False)
-            p.set_timestamp(sim_time)
-            # p.set_timestamp(time.time() + dest.get_decryption_delay())
+            p.set_timestamp(sim_time + dest.get_decryption_delay())
             node_comm.send_packet(self, dest, p)
 
             if debug: print("Sending pay message to node communicator from %s (-> %s)." % (self, dest))
@@ -729,85 +756,6 @@ class Node:
             else:
                 return False
 
-    def _find_path_old(self, G, dest, amnt, failed_paths, k=False):
-        """Attempt to find the next shortest path from self to dest within graph G, that is not in failed_paths.
-
-        Adapted from NetworkX shorest_simple_paths src code.
-
-        Args:
-            G: NetworkX graph in use.
-            dest: (Node) destination node to attempt to find best path to.
-            amnt: (float) number of satoshi the resultant path must support.
-            failed_paths: (list) previously yielded routes to skip.
-            k: (int) number of new paths to find.
-
-        Returns:
-            a generator that produces a list of possible paths, from best to worst.
-
-        Raises:
-            NetworkXError: if self or dest are not in the input graph.
-            NetworkXNoPath: if no other paths exists from src to dest.
-        """
-        if self not in G:
-            raise nx.NodeNotFound("Src [%s] not in graph" % self)
-
-        if dest not in G:
-            raise nx.NodeNotFound("Dest [%s] not in graph" % dest)
-
-        def length_func(path):
-            send_amnts = calc_path_fees(G, path, amnt)
-            return send_amnts[0] - amnt
-
-        shortest_path_func = _dijkstra_reverse
-
-        listA = []  # Previously yielded paths
-        listB = PathBuffer()
-
-        for p in failed_paths:
-            listA.append(p[1])
-            listB.push(p[0], p[1])
-            listB.pop()
-
-        if len(listA) > 0:
-            prev_path = listA[-1]
-        else:
-            prev_path = None
-
-        num_to_find = len(failed_paths) if not k else k - 1
-
-        # Find one new path per func call, up until a global maximum.
-        while len(listA) <= num_to_find and len(listA) < MAX_PATH_ATTEMPTS:
-            if not prev_path:
-                length, path = shortest_path_func(G, self, dest, amnt)
-                listB.push(length, path)
-            else:
-                ignore_nodes = set()
-                ignore_edges = set()
-                for i in range(1, len(prev_path)):
-                    root = prev_path[:i]
-                    for path in listA:
-                        if path[:i] == root:
-                            ignore_edges.add((path[i - 1], path[i]))
-                    try:
-                        spur_attempt = shortest_path_func(G, root[-1], dest, amnt,
-                                                          ignore_nodes=ignore_nodes,
-                                                          ignore_edges=ignore_edges)
-                        if spur_attempt:
-                            length, spur = spur_attempt
-                            path = root[:-1] + spur
-                            listB.push(length_func(path), path)
-                    except nx.NetworkXNoPath:
-                        pass
-                    ignore_nodes.add(root[-1])
-
-            if listB:
-                path = listB.pop()
-                yield path
-                listA.append(path)
-                prev_path = path
-            else:
-                raise nx.NetworkXNoPath()
-
     def _init_payment(self, G, dest, amnt, node_comm, subpayment=False, routes=[], route_index=0, test_mode=False, debug=DEBUG):
         """Initialise a regular single payment from this node to destination node of amnt.
 
@@ -832,6 +780,7 @@ class Node:
         global fail_count
         global total_path_hops
         global total_paths_found
+        global path_too_large_count
 
         if subpayment:
             if len(routes) > 0:
@@ -840,15 +789,16 @@ class Node:
                 # For now, set all failed_routes for future as routes
                 id, i, n = subpayment
                 self._amp_out[id][0][i] = routes
-            else:
+            else:  # Won't go in here for my experiments
                 id, i, n = subpayment
                 failed_routes = self._amp_out[id][0][i]
 
                 paths = [p for p in self._find_path(G, dest, amnt, failed_routes)]
         else:
             # Only try best path once for regular payments
-            paths = [_dijkstra_reverse(G, self, dest, amnt)]
+            paths = [_slack_based_reverse(G, self, dest, amnt)]
 
+        # For my experiments with AMP, clause won't be entered
         if len(paths) == 0 or paths[0] is False:
             if debug: print(bcolours.FAIL + "Error: no possible routes available." + (" [%d]" % subpayment[1] if subpayment else "") + bcolours.ENDC)
             if subpayment:
@@ -863,9 +813,18 @@ class Node:
         total_paths_found += 1
 
         if len(path) - 1 > MAX_HOPS:
+            path_too_large_count += 1
+
             if debug: print(bcolours.FAIL + "Error: path exceeds max-hop distance. (%d)" % (len(path) - 1) + (" [%d]" % subpayment[1] if subpayment else "") + bcolours.ENDC)
             if subpayment:
                 self._amp_out[id][0][i].append(path)
+                if not AMP_RESEND:
+                    if self._amp_out[id][2]:
+                        self._amp_out[id][2] = False
+                        fail_count += 1
+                else:
+                    # Need to re-send here instead of returning False, not in experiments so ignore for now
+                    pass
             else:
                 fail_count += 1
             return False
@@ -878,9 +837,7 @@ class Node:
 
         p = Packet(path, index_mapping, send_amnts, type,
             (subpayment[0], subpayment[1], subpayment[2], ttl) if subpayment else False)
-        p.set_timestamp(sim_time)
-
-        # p.set_timestamp(time.time() + self._encryption_delay + dest.get_decryption_delay())
+        p.set_timestamp(sim_time + self._encryption_delay + dest.get_decryption_delay())
 
         if debug: print("Sending %s message to node communicator from %s (-> %s)." % (type, self, path[1]) + (" [%d]" % subpayment[1] if subpayment else ""))
         node_comm.send_packet(self, path[1], p)
@@ -911,17 +868,17 @@ class Node:
             id = uuid4()
 
             # After timeout, attempt at AMP cancelled
-            ttl = time.time() + AMP_TIMEOUT
+            ttl = sim_time + AMP_TIMEOUT
             self._amp_out[id] = [subp_statuses, ttl, True]  # True here means hasn't failed yet
 
             routes = [p for p in self._find_path(G, dest, amnt / k, [], k=k)]
 
-            if k > 1 and len(routes) != k:  # AMP
+            if k > 1 and len(routes) != k:  # AMP, didn't find any route
                 fail_count += 1
-
-            # Send off each subpayment - first attempt.
-            for i in range(k):
-                self._init_payment(G, dest, amnt / k, node_comm, (id, i, k), routes=routes, route_index=i, test_mode=test_mode, debug=debug)
+            else:
+                # Send off each subpayment - first attempt.
+                for i in range(k):
+                    self._init_payment(G, dest, amnt / k, node_comm, (id, i, k), routes=routes, route_index=i, test_mode=test_mode, debug=debug)
 
     def get_total_equity(self, G):
         """Returns the total equity held by a node (not locked up in HTLCs). """
@@ -1019,7 +976,7 @@ def calc_path_fees(G, path, amnt):
     """
     hop_amnts = [amnt]
     for i in range(len(path)-2):
-        fees = G[path[i+1]][path[i]]["fees"]  # Read fee rate from side nearest real source
+        fees = G[path[i]][path[i+1]]["fees"]
         fee_this_hop = floor_msat(fees[0] + fees[1] * hop_amnts[-1]) # Fees always floored to nearest msat
         hop_amnts.append(fee_this_hop + hop_amnts[-1])
     return hop_amnts[::-1]
@@ -1089,7 +1046,7 @@ def _dijkstra_reverse(G, source, target, initial_amnt, avoid_edges=None):
     pop = heappop
     dist = {}  # Dictionary of final distances
     seen = {}
-    paths = {source: ([source], 0)}
+    paths = {source: [source]}
 
     # Fringe is heapq with 3-tuples (distance, c, node)
     # Use the count c to avoid comparing nodes (may not be able to)
@@ -1108,7 +1065,7 @@ def _dijkstra_reverse(G, source, target, initial_amnt, avoid_edges=None):
             break
         for w in Gsucc(v):
             # No fees on last hop
-            cost = 0 if v == source else weight(G[w][v], paths[v][1] + initial_amnt)
+            cost = 0 if v == source else weight(G[w][v], seen[v] + initial_amnt)
             vw_dist = dist[v] + cost
 
             if avoid_edges and (w, v) in avoid_edges:
@@ -1119,18 +1076,18 @@ def _dijkstra_reverse(G, source, target, initial_amnt, avoid_edges=None):
                 # But only if the path "supports" the amnt with fees
                 # If this is the last hop, we know the equity at one side of the channel
                 if (w == target and cost + initial_amnt <= G[w][v]["equity"]) or \
-                    (w != target and cost + initial_amnt <= G[w][v]["equity"] + G[v][w]["equity"]):
+                    (w != target and cost + initial_amnt <= G[w][v]["public_equity"] + G[v][w]["public_equity"]):
                     seen[w] = vw_dist
                     push(fringe, (vw_dist, next(c), w))
-                    paths[w] = (paths[v][0] + [w], cost)
+                    paths[w] = (paths[v] + [w])
     if target in dist:
         # Reverse the path!
-        return dist[target], paths[target][0][::-1]
+        return dist[target], paths[target][::-1]
     else:
         # No path found
         return False
 
-def _jit_dijsktra_reverse(G, source, jit_target, initial_amnt):
+def _jit_dijsktra_reverse(G, source, jit_target, initial_amnt, full_knowledge=JIT_FULL_KNOWLEDGE):
     """Find a path from source to target, starting the search from the target towards source.
 
     This is for finding JIT routing.
@@ -1144,7 +1101,7 @@ def _jit_dijsktra_reverse(G, source, jit_target, initial_amnt):
     Args:
         G: NetworkX graph in use.
         source: (Node) source node.
-        jit_target: (Node) destination node.
+        jit_target: (Node) second last node before returning to source.
         initial_amnt: (float) amnt of satoshi intended to be transferred on the last hop to the target.
 
     Returns:
@@ -1162,7 +1119,7 @@ def _jit_dijsktra_reverse(G, source, jit_target, initial_amnt):
     pop = heappop
     dist = {}  # Dictionary of final distances
     seen = {}
-    paths = {source: ([source], 0)}
+    paths = {source: [source]}
 
     # Fringe is heapq with 3-tuples (distance, c, node)
     # Use the count c to avoid comparing nodes (may not be able to)
@@ -1195,21 +1152,21 @@ def _jit_dijsktra_reverse(G, source, jit_target, initial_amnt):
                     continue
 
             # No fees on last hop
-            cost = 0 if v == source else weight(G[w][v], paths[v][1] + initial_amnt)
+            cost = 0 if v == source else weight(G[w][v], seen[v] + initial_amnt)
             vw_dist = dist[v] + cost
 
             if w not in seen or vw_dist < seen[w] or seen[w] == 0:
                 # Add or update if new shortest distance from src -> u
                 # But only if the path "supports" the amnt with fees
                 # If this is the first or last hop, we know the equity at one side of the channel
-                if ((w == jit_target or w == source or JIT_FULL_KNOWLEDGE) and cost + initial_amnt <= G[w][v]["equity"]) or \
-                    (not (w == jit_target or w == source or JIT_FULL_KNOWLEDGE) and cost + initial_amnt <= G[w][v]["equity"] + G[v][w]["equity"]):
+                if ((w == jit_target or w == source or full_knowledge) and cost + initial_amnt <= G[w][v]["equity"]) or \
+                    (not (w == jit_target or w == source or full_knowledge) and cost + initial_amnt <= G[w][v]["public_equity"] + G[v][w]["public_equity"]):
                     seen[w] = vw_dist
                     push(fringe, (vw_dist, next(c), w))
-                    paths[w] = (paths[v][0] + [w], cost)
+                    paths[w] = (paths[v] + [w])
     if source in dist:
         # Reverse the path!
-        return dist[source], paths[source][0][::-1]
+        return dist[source], paths[source][::-1]
     else:
         # No path found
         return False
@@ -1248,9 +1205,9 @@ def _slack_based_reverse(G, source, target, initial_amnt):
     slacks = {}  # Dictionary of values relating to slack in path so far
     dist = {}  # Dictionary of distances so far
     seen = {}
-    paths = {source: ([source], 0)}
+    paths = {source: [source]}
 
-    # Fringe is heapq with 5-tuples (slack val, c, node, distance, prev node in path len path)
+    # Fringe is heapq with 6-tuples (slack val, c, node, distance, prev node in path, len path)
     # Use the count c to avoid comparing nodes (may not be able to)
     c = count()
     fringe = []
@@ -1260,37 +1217,108 @@ def _slack_based_reverse(G, source, target, initial_amnt):
 
     while fringe:
         (slack_val, _, v, d, prev_node, len_path) = pop(fringe)
-        if v in slacks:
+        slack_val = slack_val * -1
+        if v in dist:
             continue  # Already searched this node.
         slacks[v] = slack_val
         dist[v] = d
         if v == target:
             continue
         for w in Gsucc(v):
-            if w == prev_node:  # Don't back-track directly
-                continue
             # No fees on last hop
-            cost = 0 if v == source else fees_weight(G[w][v], paths[v][1] + initial_amnt)
+            cost = 0 if v == source else fees_weight(G[w][v], seen[v] + initial_amnt)
             vw_dist = dist[v] + cost
 
-            vw_slack = (G[w][v]["equity"] + G[v][w]["equity"]) - (vw_dist + initial_amnt)
-            new_slack_val = (len_path**2 * slack_val + vw_slack) / ((len_path + 1)**2)
-            # if avoid_edges and (w, v) in avoid_edges:
-            #     vw_dist += 1000  # Bump up cost to avoid these edges
+            if v == target:
+                new_slack_val = slack_val
+            else:
+                vw_slack = (G[w][v]["public_equity"] + G[v][w]["public_equity"]) - (vw_dist + initial_amnt)
+                new_slack_val = (len_path * slack_val + vw_slack) / (len_path + 1)
 
-            if w not in seen or new_slack_val > seen[w]:
+            if len_path > (8 - 1):
+                new_slack_val = -inf
+
+            if w not in seen or new_slack_val > slacks[w]:
                 # Add or update if new shortest distance from src -> u
                 # But only if the path "supports" the amnt with fees
                 # If this is the last hop, we know the equity at one side of the channel
                 if (w == target and cost + initial_amnt <= G[w][v]["equity"]) or \
-                    (w != target and cost + initial_amnt <= G[w][v]["equity"] + G[v][w]["equity"]):
-                    seen[w] = new_slack_val
+                    (w != target and cost + initial_amnt <= G[w][v]["public_equity"] + G[v][w]["public_equity"]):
+                    seen[w] = vw_dist
+                    slacks[w] = new_slack_val
                     # Negated so max heap instead of min heap - want highest slack
-                    push(fringe, (new_slack_val, next(c), w, cost, v, len_path + 1))
-                    paths[w] = (paths[v][0] + [w], cost)
+                    push(fringe, (-new_slack_val, next(c), w, vw_dist, v, len_path + 1))
+                    paths[w] = (paths[v] + [w])
     if target in dist:
         # Reverse the path!
-        return dist[target], paths[target][0][::-1]
+        return dist[target], paths[target][::-1]
+    else:
+        # No path found
+        return False
+
+def _bfs_reverse(G, source, target, initial_amnt):
+    """Find a path from source to target, starting the search from the target towards source.
+
+    Only supports directed graph.
+
+    Constaint: path must be able to support amnt with compounded fees.
+
+    Uses the breatdh first search algorithm.
+
+    Args:
+        G: NetworkX graph in use.
+        source: (Node) source node.
+        target: (Node) destination node.
+        initial_amnt: (float) amnt of satoshi intended to be transferred on the last hop to the target.
+    Returns:
+        the length of the shortest hop path found, using the given weight function and,
+        the corresponding shortest hop path found.
+    """
+    source, target = target, source  # Search from target instead
+
+    # Weight - Fee calculation on directed edge for a given amnt
+    weight = lambda d, amnt: d["fees"][0] + d["fees"][1] * amnt
+
+    Gsucc = G.successors
+
+    push = heappush
+    pop = heappop
+    dist = {}  # Dictionary of final distances
+    seen = {}
+    paths = {source: [source]}
+
+    # Fringe is heapq with 3-tuples (const 1, c, node, distance)
+    # Use the count c to avoid comparing nodes (may not be able to)
+    c = count()
+    fringe = []
+
+    seen[source] = 0
+    push(fringe, (1, next(c), source, 0))
+
+    while fringe:
+        (_, _, v, d) = pop(fringe)
+        if v in dist:
+            continue  # Already searched this node.
+        dist[v] = d
+        if v == target:
+            break
+        for w in Gsucc(v):
+            # No fees on last hop
+            cost = 0 if v == source else weight(G[w][v], seen[v] + initial_amnt)
+            vw_dist = dist[v] + cost
+
+            if w not in seen:
+                # Add or update if new shortest distance from src -> u
+                # But only if the path "supports" the amnt with fees
+                # If this is the last hop, we know the equity at one side of the channel
+                if (w == target and cost + initial_amnt <= G[w][v]["equity"]) or \
+                    (w != target and cost + initial_amnt <= G[w][v]["public_equity"] + G[v][w]["public_equity"]):
+                    seen[w] = vw_dist
+                    push(fringe, (1, next(c), w, vw_dist))
+                    paths[w] = (paths[v] + [w])
+    if target in dist:
+        # Reverse the path!
+        return dist[target], paths[target][::-1]
     else:
         # No path found
         return False
@@ -1316,16 +1344,24 @@ def init_random_node(i):
 
 def generate_edge_args():
     """Generate random equity and fee distribution arguments for a new pair of edges. """
-    amnt_a = np.random.choice([8000000, 500000], 1, p=[0.2, 0.8])[0]
-    amnt_b = np.random.choice([8000000, 500000], 1, p=[0.2, 0.8])[0]
+    amnt_a = np.random.choice([8000000, 500000], 1, p=[HIGH_FUNDS_CHANCE, 1 - HIGH_FUNDS_CHANCE])[0]
+    amnt_b = np.random.choice([8000000, 500000], 1, p=[HIGH_FUNDS_CHANCE, 1 - HIGH_FUNDS_CHANCE])[0]
 
-    base_fee_a = np.random.choice([0, 1, 2], 1, p=[0.0, 1.0, 0.0])[0]
-    base_fee_b = np.random.choice([0, 1, 2], 1, p=[0.0, 1.0, 0.0])[0]
+    # For search strat experiments
+    # base_fee_a = np.random.choice([0, 0.0025, 1, 5], 1, p=[0.05, 0.2, 0.7, 0.05])[0]
+    # base_fee_b = np.random.choice([0, 0.0025, 1, 5], 1, p=[0.05, 0.2, 0.7, 0.05])[0]
+    #
+    # fee_rate_a = np.random.choice([0, 0.00001, 0.00055, 0.001, 0.003], 1, p=[0.05, 0.45, 0.25, 0.2, 0.05])[0]
+    # fee_rate_b = np.random.choice([0, 0.00001, 0.00055, 0.001, 0.003], 1, p=[0.05, 0.45, 0.25, 0.2, 0.05])[0]
+
+    # Regular experiments
+    base_fee_a = 1
+    base_fee_b = 1
 
     fee_rate_a = base_fee_a * 0.000001
     fee_rate_b = base_fee_b * 0.000001
 
-    dir_a = [amnt_a, [base_fee_a, fee_rate_a]]  # Default fees, also LN median
+    dir_a = [amnt_a, [base_fee_a, fee_rate_a]]
     dir_b = [amnt_b, [base_fee_b, fee_rate_b]]
 
     return [dir_a, dir_b]
@@ -1368,12 +1404,12 @@ def generate_wattz_strogatz(n, k, p, seed=None, test=False):
         pairs = list(zip(nodes, targets))
         for pair in pairs:
             if test:
-                G.add_edge(pair[0], pair[1], equity=20, fees=[0.1, 0.005])
-                G.add_edge(pair[1], pair[0], equity=10, fees=[0.1, 0.005])
+                G.add_edge(pair[0], pair[1], equity=20, public_equity=20, fees=[0.1, 0.005], fee_metrics=[None, 0, 0])
+                G.add_edge(pair[1], pair[0], equity=10, public_equity=10, fees=[0.1, 0.005], fee_metrics=[None, 0, 0])
             else:
                 args = generate_edge_args()
-                G.add_edge(pair[0], pair[1], equity=args[0][0], fees=args[0][1], fee_metrics=[None, 0, 0])
-                G.add_edge(pair[1], pair[0], equity=args[1][0], fees=args[1][1], fee_metrics=[None, 0, 0])
+                G.add_edge(pair[0], pair[1], equity=args[0][0], public_equity=args[0][0], fees=args[0][1], fee_metrics=[None, 0, 0])
+                G.add_edge(pair[1], pair[0], equity=args[1][0], public_equity=args[1][0], fees=args[1][1], fee_metrics=[None, 0, 0])
             edge_pairs.add((pair[0], pair[1]))
 
     # Rewire edges from each node
@@ -1396,12 +1432,12 @@ def generate_wattz_strogatz(n, k, p, seed=None, test=False):
                     edge_pairs.remove((u, v))
 
                     if test:
-                        G.add_edge(u, w, equity=20, fees=[0.1, 0.005])
-                        G.add_edge(w, u, equity=10, fees=[0.1, 0.005])
+                        G.add_edge(u, w, equity=20, public_equity=20, fees=[0.1, 0.005], fee_metrics=[None, 0, 0])
+                        G.add_edge(w, u, equity=10, public_equity=10, fees=[0.1, 0.005], fee_metrics=[None, 0, 0])
                     else:
                         args = generate_edge_args()
-                        G.add_edge(u, w, equity=args[0][0], fees=args[0][1], fee_metrics=[None, 0, 0])
-                        G.add_edge(w, u, equity=args[1][0], fees=args[1][1], fee_metrics=[None, 0, 0])
+                        G.add_edge(u, w, equity=args[0][0], public_equity=args[0][0], fees=args[0][1], fee_metrics=[None, 0, 0])
+                        G.add_edge(w, u, equity=args[1][0], public_equity=args[1][0], fees=args[1][1], fee_metrics=[None, 0, 0])
                     edge_pairs.add((u, w))
     return G, edge_pairs
 
@@ -1445,8 +1481,8 @@ def generate_barabasi_albert(n, m, seed=None):
         pairs = list(zip([src_node] * m, targets))
         for pair in pairs:
             args = generate_edge_args()
-            G.add_edge(pair[0], pair[1], equity=args[0][0], fees=args[0][1], fee_metrics=[None, 0, 0])
-            G.add_edge(pair[1], pair[0], equity=args[1][0], fees=args[1][1], fee_metrics=[None, 0, 0])
+            G.add_edge(pair[0], pair[1], equity=args[0][0], public_equity=args[0][0], fees=args[0][1], fee_metrics=[None, 0, 0])
+            G.add_edge(pair[1], pair[0], equity=args[1][0], public_equity=args[1][0], fees=args[1][1], fee_metrics=[None, 0, 0])
 
             edge_pairs.add((pair[0], pair[1]))
 
@@ -1491,18 +1527,23 @@ def select_pay_amnt(G, node):
     max_amnt = 800000
 
     return np.random.randint(1, max_amnt + 1)
-    # multiplier = np.random.choice([0.2, 0.4, 0.6, 0.8], 1, [0.8, 0.05, 0.05, 0.05])[0]
-    # return floor(max_amnt * multiplier)
 
-def simulator(max_multiplier, send_timing, rb=0.0, k=1, ws=True):
+def simulator(max_multiplier, send_timing, rb=0.0, hfc=0.2, k=1, ws=True):
     """Main simulator calling function. """
     global success_count
     global fail_count
     global sim_time
     global packet_queue
+    global amp_retry_count
+    global total_path_hops
+    global total_paths_found
+    global path_too_large_count
 
     global ROLE_BIAS
     ROLE_BIAS = rb
+
+    global HIGH_FUNDS_CHANCE
+    HIGH_FUNDS_CHANCE = hfc
 
     start_time = time.time()
 
@@ -1516,18 +1557,14 @@ def simulator(max_multiplier, send_timing, rb=0.0, k=1, ws=True):
     print("max_amnt:", max_multiplier * 100000)
     print("Timing:", send_timing)
     print("role bias:", ROLE_BIAS)
+    print("High funds chance:", HIGH_FUNDS_CHANCE)
     print("k [AMP]:", k)
     print("JIT: [%s (repeat: %s // full knowledge: %s)]" % (JIT_ROUTING, JIT_REPEAT_REBALANCE, JIT_FULL_KNOWLEDGE))
 
     start_unbalance = calc_g_unbalance(G, pairs)
-    # print(start_unbalance)
 
     nodes = list(G)
-
-    # nx.draw(G)
-    # plt.show()
-
-    node_comm = NodeCommunicator(nodes, pairs, debug=False)
+    node_comm = NodeCommunicator(nodes, pairs, debug=DEBUG)
 
     consumers = []
     merchants = []
@@ -1542,12 +1579,6 @@ def simulator(max_multiplier, send_timing, rb=0.0, k=1, ws=True):
             total_freqs[0] += node.get_spend_freq()
             total_freqs[2] += node.get_receive_freq()
 
-    # Here - select nodes and attempt payments + record
-    # Selected using select_payment_nodes
-    # Need to decide how many satoshi per payment (based on available balance etc?)
-    # Need to decide how to split up payments - trial & error.
-    # Question: do we avoid selecting src_nodes that can't send money or count that as failure?
-
     sent_payments = 0
     last_success = 0
 
@@ -1558,7 +1589,15 @@ def simulator(max_multiplier, send_timing, rb=0.0, k=1, ws=True):
 
     next_payment_time = 0
 
+    show = True
+
     while success_count + fail_count < TOTAL_TO_SEND:
+    # while success_count < 100 or success_count / (success_count + fail_count) >= 0.7:
+        if (success_count + fail_count) % 5000 == 0:
+            if show: print(success_count + fail_count, "sent")
+            show = False
+        else:
+            show = True
         try:
             try:
                 p, node = packet_queue.get(False)
@@ -1569,7 +1608,7 @@ def simulator(max_multiplier, send_timing, rb=0.0, k=1, ws=True):
                     packet_queue.put((p, node))
 
                     if next_payment_time <= sim_time:
-                        in_flight_tracker += sent_payments - success_count - fail_count
+                        in_flight_tracker += (sent_payments - success_count - fail_count)
                         c += 1
 
                         selected = select_payment_nodes(consumers, merchants, total_freqs)
@@ -1587,7 +1626,7 @@ def simulator(max_multiplier, send_timing, rb=0.0, k=1, ws=True):
 
                     sim_time = min(p.get_timestamp(), next_payment_time)
             except:  # Jump to next sending of a payment
-                in_flight_tracker += sent_payments - success_count - fail_count
+                in_flight_tracker += (sent_payments - success_count - fail_count)
                 c += 1
 
                 selected = select_payment_nodes(consumers, merchants, total_freqs)
@@ -1612,11 +1651,18 @@ def simulator(max_multiplier, send_timing, rb=0.0, k=1, ws=True):
     print("# amp retries:", amp_retry_count)
     print("Avg in flight:", in_flight_tracker / c)
     print("# Avg path hops:", total_path_hops / total_paths_found)
+    print("Total paths over max len:", path_too_large_count)
     print("Time to run:", (time.time() - start_time) / 60)
 
     # Reset
     success_count = 0
     fail_count = 0
+    sim_time = 0
+    amp_retry_count = 0
+    total_path_hops = 0
+    total_paths_found = 0
+    path_too_large_count = 0
+    packet_queue = PriorityQueue()
 
 """
 //////////////////////////
@@ -1624,330 +1670,541 @@ CORE FUNCTIONALITY TESTING
 //////////////////////////
 """
 
-def test_func():
+def process_next_test_packet(G, node_comm, debug, type=False, amp_resend_enabled=False, jit_enabled=False, node_check=False):
+    """Process the next packet when testing."""
+    global packet_queue
     global sim_time
-    TEST_DEBUG = False
-
-    sim_time = 0
-
-    G = nx.DiGraph()
-    nodes = [Node(i, False, 0, 0, 0, 0) for i in range(6)]
-    edge_pairs = set()
-
-    G.add_edge(nodes[3], nodes[0], equity=20, fees=[1, 0.0])
-    G.add_edge(nodes[0], nodes[3], equity=10, fees=[1, 0.0])
-    edge_pairs.add((nodes[3], nodes[0]))
-
-    G.add_edge(nodes[0], nodes[1], equity=10, fees=[1, 0.0])
-    G.add_edge(nodes[1], nodes[0], equity=20, fees=[1, 0.0])
-    edge_pairs.add((nodes[0], nodes[1]))
-
-    G.add_edge(nodes[0], nodes[2], equity=20, fees=[1, 0.0])
-    G.add_edge(nodes[2], nodes[0], equity=10, fees=[1, 0.0])
-    edge_pairs.add((nodes[0], nodes[2]))
-
-    G.add_edge(nodes[1], nodes[2], equity=30, fees=[1, 0.0])
-    G.add_edge(nodes[2], nodes[1], equity=0, fees=[1, 0.0])
-    edge_pairs.add((nodes[1], nodes[2]))
-
-    G.add_edge(nodes[1], nodes[4], equity=20, fees=[1, 0.0])
-    G.add_edge(nodes[4], nodes[1], equity=10, fees=[1, 0.0])
-    edge_pairs.add((nodes[1], nodes[4]))
-
-    node_comm_test = NodeCommunicator(nodes, edge_pairs, test_mode=True, debug=TEST_DEBUG)
-
-    nodes[3]._init_payment(G, nodes[4], 10, node_comm_test)
 
     p, node = packet_queue.get(False)
+    if type: assert p.get_type() == type
+    if node_check: assert node == node_check
 
-    if p.get_timestamp() <= sim_time:
-        node.process_packet(G, node_comm_test, p)
-    else:  # Put it back on
-        packet_queue.put((p, node))
+    sim_time = p.get_timestamp()
+    node.process_packet(G, node_comm, p, amp_resend_enabled=amp_resend_enabled, jit_enabled=jit_enabled, debug=debug)
 
-    nodes[3]._init_payment(G, nodes[4], 5, node_comm_test)
+def test_func():
+    """Testing."""
+    global sim_time
 
-    while True:
-        if p.get_timestamp() <= sim_time:
-            node.process_packet(G, node_comm_test, p)
-        else:  # Put it back on
-            packet_queue.put((p, node))
-
-    return
-
-    ################## func: _dijkstra_reverse ###########
-    if TEST_DEBUG: print("// PATH FINDING\n-------------------------")
+    sim_time = 0
+    TEST_DEBUG = False
 
     G, pairs = generate_wattz_strogatz(NUM_TEST_NODES, 6, 0.3, 10, True)
     nodes = list(G)
 
     node_comm = NodeCommunicator(nodes, pairs, test_mode=True, debug=TEST_DEBUG)
 
-    length, path = _dijkstra_reverse(G, nodes[0], nodes[14], 5)
+    ####################################
+    # PATHFINDING & FEES
+    ####################################
 
-    assert path == [nodes[0], nodes[19], nodes[14]]
+    nodes_ = []
+    for i in range(8):
+        nodes_.append(init_random_node(i))
 
-    ################## func: send_direct ###########
-    if TEST_DEBUG: print("// SUCCESSFUL DIRECT TRANSFER\n-------------------------")
+    G_ = nx.DiGraph()
+    G_.add_nodes_from(nodes_)
 
-    e_4_5 = G[nodes[4]][nodes[5]]["equity"]
-    e_5_4 = G[nodes[5]][nodes[4]]["equity"]
+    G_.add_edge(nodes_[0], nodes_[1], equity=150, public_equity=150, fees=[1, 0.001])
+    G_.add_edge(nodes_[1], nodes_[0], equity=50, public_equity=50, fees=[1, 0.001])
 
-    nodes[4].send_direct(G, nodes[5], 10, node_comm, debug=TEST_DEBUG)
-    nodes[5].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
+    G_.add_edge(nodes_[1], nodes_[2], equity=100, public_equity=100, fees=[2, 0.001])
+    G_.add_edge(nodes_[2], nodes_[1], equity=50, public_equity=50, fees=[1, 0.001])
 
-    assert G[nodes[4]][nodes[5]]["equity"] == e_4_5 - 10
-    assert G[nodes[5]][nodes[4]]["equity"] == e_5_4 + 10
+    G_.add_edge(nodes_[1], nodes_[3], equity=20, public_equity=20, fees=[2, 0.001])
+    G_.add_edge(nodes_[3], nodes_[1], equity=80, public_equity=80, fees=[1, 0.001])
 
-    if TEST_DEBUG: print("// FAILED DIRECT TRANSFER - NO CHANNEL\n-------------------------")
+    G_.add_edge(nodes_[2], nodes_[6], equity=100, public_equity=100, fees=[3, 0.001])
+    G_.add_edge(nodes_[6], nodes_[2], equity=50, public_equity=50, fees=[1, 0.001])
 
-    attempt = nodes[4].send_direct(G, nodes[17], 5, node_comm, debug=TEST_DEBUG)
+    G_.add_edge(nodes_[3], nodes_[4], equity=50, public_equity=50, fees=[5, 0.001])
+    G_.add_edge(nodes_[4], nodes_[3], equity=100, public_equity=100, fees=[1, 0.001])
+
+    G_.add_edge(nodes_[3], nodes_[5], equity=30, public_equity=30, fees=[2, 0.001])
+    G_.add_edge(nodes_[5], nodes_[3], equity=160, public_equity=160, fees=[1, 0.001])
+
+    G_.add_edge(nodes_[4], nodes_[5], equity=20, public_equity=20, fees=[1, 0.001])
+    G_.add_edge(nodes_[5], nodes_[4], equity=90, public_equity=90, fees=[1, 0.001])
+
+    G_.add_edge(nodes_[4], nodes_[6], equity=40, public_equity=40, fees=[1, 0.001])
+    G_.add_edge(nodes_[6], nodes_[4], equity=110, public_equity=110, fees=[2, 0.001])
+
+    G_.add_edge(nodes_[5], nodes_[7], equity=100, public_equity=100, fees=[1, 0.001])
+    G_.add_edge(nodes_[7], nodes_[5], equity=50, public_equity=50, fees=[1, 0.001])
+
+    G_.add_edge(nodes_[0], nodes_[7], equity=40, public_equity=40, fees=[1, 0.001])
+    G_.add_edge(nodes_[7], nodes_[0], equity=40, public_equity=40, fees=[1, 0.001])
+
+
+    ################## func: _dijkstra_reverse & _find_path
+    cost, path = _dijkstra_reverse(G_, nodes_[0], nodes_[7], 90)
+    assert floor_msat(cost) == 5.2762
+    assert path == [nodes_[0], nodes_[1], nodes_[3], nodes_[5], nodes_[7]]
+
+    # New path found, as independent as possible
+    path = [p for p in nodes_[0]._find_path(G_, nodes_[7], 90, [path])][0]
+    assert path == [nodes_[0], nodes_[1], nodes_[2], nodes_[6], nodes_[4], nodes_[5], nodes_[7]]
+
+    cost, path = _dijkstra_reverse(G_, nodes_[0], nodes_[7], 100)
+    assert floor_msat(cost) == 9.519
+    assert path == [nodes_[0], nodes_[1], nodes_[2], nodes_[6], nodes_[4], nodes_[5], nodes_[7]]
+
+    cost, path = _dijkstra_reverse(G_, nodes_[0], nodes_[7], 110)
+    assert floor_msat(cost) == 11.6896
+    assert path == [nodes_[0], nodes_[1], nodes_[2], nodes_[6], nodes_[4], nodes_[3], nodes_[5], nodes_[7]]
+
+    # Funds distribution on first hop known (last hop pathfinding)
+    attempt = _dijkstra_reverse(G_, nodes[0], nodes_[7], 160)
     assert attempt == False
 
-    ################## func: _init_payment [NON-AMP] ###########
-    if TEST_DEBUG: print("// SUCCESSFUL PAYMENT\n-------------------------")
 
-    # Payment from 0 to 14 will find path 0-19-14
-    path = [nodes[0], nodes[1], nodes[14]]
-    amnts = calc_path_fees(G, path, 5)
+    ################## func: _bfs_reverse
+    _, path = _bfs_reverse(G_, nodes_[0], nodes_[7], 10)
+    assert path == [nodes_[0], nodes_[7]]
 
+    _, path = _bfs_reverse(G_, nodes_[0], nodes_[7], 90)
+    assert path == [nodes_[0], nodes_[1], nodes_[3], nodes_[5], nodes_[7]]
+
+
+    ################## func: _slack_based_reverse
+    _, path = _slack_based_reverse(G_, nodes_[0], nodes_[7], 10)
+    assert path == [nodes_[0], nodes_[1], nodes_[2], nodes_[6], nodes_[4], nodes_[3], nodes_[5], nodes_[7]]
+
+    # Boost to change path
+    G_[nodes_[4]][nodes_[5]]["public_equity"] = 250
+
+    _, path = _slack_based_reverse(G_, nodes_[0], nodes_[7], 10)
+    assert path == [nodes_[0], nodes_[1], nodes_[2], nodes_[6], nodes_[4], nodes_[5], nodes_[7]]
+
+
+    ################## func: _jit_dijsktra_reverse
+    nodes_.append(init_random_node(8))
+
+    G_.add_edge(nodes_[3], nodes_[8], equity=40, public_equity=40, fees=[1, 0.001])
+    G_.add_edge(nodes_[8], nodes_[3], equity=40, public_equity=40, fees=[1, 0.001])
+
+    G_.add_edge(nodes_[5], nodes_[8], equity=40, public_equity=40, fees=[1, 0.001])
+    G_.add_edge(nodes_[8], nodes_[5], equity=0, public_equity=40, fees=[10, 0.001])
+
+    _, path = _jit_dijsktra_reverse(G_, nodes_[3], nodes_[5], 10)
+    assert len(path) == 4  # 3 hops
+    assert path == [nodes_[3], nodes_[4], nodes_[5], nodes_[3]]
+
+    # Reduce fees
+    G_[nodes_[8]][nodes_[5]]["fees"] = [0.5, 0.001]
+
+    _, path = _jit_dijsktra_reverse(G_, nodes_[3], nodes_[5], 10)
+    assert path == [nodes_[3], nodes_[8], nodes_[5], nodes_[3]]
+
+    # Reverts when full knowledge, as equity from 0 -> 5 is zero
+    _, path = _jit_dijsktra_reverse(G_, nodes_[3], nodes_[5], 10, full_knowledge=True)
+    assert path == [nodes_[3], nodes_[4], nodes_[5], nodes_[3]]
+
+
+    ################## func: calc_path_fees
+    # Fees are base 0.1 and 0.005 multiplier on test set, arbitarily chosen.
+    path = [nodes[0], nodes[3], nodes[18], nodes[19]]  # Existing path, 3 hops
+    hop_amnts = calc_path_fees(G, path, 10)  # Amount sent per hop
+
+    assert hop_amnts[0] == 10.3007  # 10 + 0.1 + 0.005 * 10.15 (amount sent on hop ahead) - floored to msat
+    assert hop_amnts[1] == 10.15  # 10 + 0.1 + 0.005 * 10 (original payment amount)
+    assert hop_amnts[2] == 10  # No fees on last hop
+
+
+
+    ####################################
+    # REGULAR PAYMENTS
+    ####################################
+
+    ################## single-hop: success & failure
     e_0_19 = G[nodes[0]][nodes[19]]["equity"]
-    e_19_0 = G[nodes[19]][nodes[0]]["equity"]
-    e_19_14 = G[nodes[19]][nodes[14]]["equity"]
-    e_14_19 = G[nodes[14]][nodes[19]]["equity"]
+    nodes[0].init_payment(G, nodes[19], 10, node_comm, test_mode=True, debug=TEST_DEBUG)
+    nodes[0].init_payment(G, nodes[19], 10, node_comm, test_mode=True, debug=TEST_DEBUG)
 
-    # Initialise by sending message from 0 to 1 and propagating out and in.
-    nodes[0]._init_payment(G, nodes[14], 5, node_comm, test_mode=True, debug=TEST_DEBUG)
-    nodes[19].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
-    nodes[14].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
-    nodes[19].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
-    nodes[0].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG)
+    assert G[nodes[0]][nodes[19]]["equity"] == e_0_19 - 10  # Success
 
-    assert G[nodes[0]][nodes[19]]["equity"] == e_0_19 - amnts[0]
-    assert G[nodes[19]][nodes[0]]["equity"] == e_19_0 + amnts[0]
-    assert G[nodes[19]][nodes[14]]["equity"] == e_19_14 - amnts[1]
-    assert G[nodes[14]][nodes[19]]["equity"] == e_14_19 + amnts[1]
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG)
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG)
+    assert G[nodes[0]][nodes[19]]["equity"] == e_0_19 - 10  # Hasn't changed - failure
 
-    if TEST_DEBUG: print("\n// FAILED PAYMENT\n-------------------------")
 
-    # Equity from 19 to 14 depleted too much, so try this route again to test
-    # for funds being released back correctly when a route fails mid-way forward.
-    nodes[0]._init_payment(G, nodes[14], 25, node_comm, test_mode=True, debug=TEST_DEBUG)
-    nodes[19].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
-    nodes[0].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
+    ################## multi-hop: success [Path: 0 - 2 - 4]
+    e_0_2 = G[nodes[0]][nodes[2]]["equity"]
+    e_2_0 = G[nodes[2]][nodes[0]]["equity"]
+    e_2_4 = G[nodes[2]][nodes[4]]["equity"]
+    e_4_2 = G[nodes[4]][nodes[2]]["equity"]
+    nodes[0].init_payment(G, nodes[4], 10, node_comm, test_mode=True, debug=TEST_DEBUG)
 
-    # Should be the same as payment only made it one hop.
-    assert G[nodes[0]][nodes[19]]["equity"] == e_0_19 - amnts[0]
-    assert G[nodes[19]][nodes[0]]["equity"] == e_19_0 + amnts[0]
-    assert G[nodes[19]][nodes[14]]["equity"] == e_19_14 - amnts[1]
-    assert G[nodes[14]][nodes[19]]["equity"] == e_14_19 + amnts[1]
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG)
+    assert G[nodes[0]][nodes[2]]["equity"] == e_0_2 - 10.15  # Reduced
+    assert G[nodes[2]][nodes[0]]["equity"] == e_2_0  # Hasn't increased yet
 
-    # No route available
-    if TEST_DEBUG: print("\n// NO ROUTE AVAILABLE\n-------------------------")
-    assert nodes[0]._init_payment(G, nodes[14], 100, node_comm, test_mode=True, debug=TEST_DEBUG) == False
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG)
+    assert G[nodes[2]][nodes[4]]["equity"] == e_2_4 - 10  # Reduced
+    assert G[nodes[4]][nodes[2]]["equity"] == e_4_2 + 10  # Automatically claimed
 
-    # One-hop payments - make sure finds direct path.
-    if TEST_DEBUG: print("\n// ONE-HOP PAYMENT\n-------------------------")
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG)
+    assert G[nodes[2]][nodes[0]]["equity"] == e_2_0 + 10.15  # Claimed
 
-    path = [nodes[11], nodes[9]]
-    amnts = calc_path_fees(G, path, 5)
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG)  # Complete proof of payment
 
-    e_11_9 = G[nodes[11]][nodes[9]]["equity"]
-    e_9_11 = G[nodes[9]][nodes[11]]["equity"]
 
-    nodes[11]._init_payment(G, nodes[9], 5, node_comm, test_mode=True, debug=TEST_DEBUG)
-    nodes[9].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
+    ################## multi-hop: fail by insufficient funds @ start [Path: 0 - 2 - 4]
+    G[nodes[2]][nodes[4]]["equity"] = 2  # Reduce so path will fail
 
-    assert G[nodes[11]][nodes[9]]["equity"] == e_11_9 - amnts[0]
-    assert G[nodes[9]][nodes[11]]["equity"] == e_9_11 + amnts[0]
+    e_0_2 = G[nodes[0]][nodes[2]]["equity"]
+    e_2_0 = G[nodes[2]][nodes[0]]["equity"]
+    e_2_4 = G[nodes[2]][nodes[4]]["equity"]
+    e_4_2 = G[nodes[4]][nodes[2]]["equity"]
+    nodes[0].init_payment(G, nodes[4], 5, node_comm, test_mode=True, debug=TEST_DEBUG)
 
-    ################## func: make_payment [AMP] ################
-    # Re-init just in case
-    G, pairs = generate_wattz_strogatz(NUM_TEST_NODES, 6, 0.3, 10, True)
-    nodes = list(G)
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG)
+    assert G[nodes[0]][nodes[2]]["equity"] == e_0_2 - 5.125  # Reduced
+    assert G[nodes[2]][nodes[0]]["equity"] == e_2_0  # Hasn't increased yet
 
-    # Need to re-init for new node/edge references
-    node_comm = NodeCommunicator(nodes, pairs, test_mode=True, debug=TEST_DEBUG)
+    # Cancel immediately, not cancel_rest
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG, type="cancel")
 
-    if TEST_DEBUG: print("\n// AMP SUCCESS - NO FAILED ROUTES\n-------------------------")
+    # Claimed back, and all return original amounts
+    assert G[nodes[0]][nodes[2]]["equity"] == e_0_2
+    assert G[nodes[2]][nodes[0]]["equity"] == e_2_0
+    assert G[nodes[2]][nodes[4]]["equity"] == e_2_4
+    assert G[nodes[4]][nodes[2]]["equity"] == e_4_2
 
-    # From above, we've already tested that single payments work and if they fail revert correctly
-    # So, for AMP - need to check:
-    #   1) split payment that works straight off
-    #   2) fails overall with subpayments that didn't fail reverting
-    #   3) fails, retries routes and works
 
-    # Works with no fails - right now, this means it tries same route and keeps working.
-    # Again 0-19-14 sent as packets of 3/3/4
-    path = [nodes[0], nodes[19], nodes[14]]
-    amnts = calc_path_fees(G, path, 3)
-    amnts_2 = calc_path_fees(G, path, 4)
+    ################## multi-hop: fail by funds reduced mid-payment [Path: 0 - 2 - 4]
+    G[nodes[2]][nodes[4]]["equity"] = 10  # Revert
+
+    e_0_2 = G[nodes[0]][nodes[2]]["equity"]
+    e_2_0 = G[nodes[2]][nodes[0]]["equity"]
+    e_2_4 = G[nodes[2]][nodes[4]]["equity"]
+    e_4_2 = G[nodes[4]][nodes[2]]["equity"]
+    nodes[0].init_payment(G, nodes[4], 5, node_comm, test_mode=True, debug=TEST_DEBUG)
+
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG)
+    assert G[nodes[0]][nodes[2]]["equity"] == e_0_2 - 5.125  # Reduced
+    assert G[nodes[2]][nodes[0]]["equity"] == e_2_0  # Hasn't increased yet
+
+    G[nodes[2]][nodes[4]]["equity"] = 2  # Reduce so path will fail - mid-payment
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG)
+
+    # Propogate cancel back, no HTLC on first cancellation, so cancel_rest first
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG, type="cancel_rest")
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG, type="cancel")
+
+    # Claimed back, and all return original amounts
+    assert G[nodes[0]][nodes[2]]["equity"] == e_0_2
+    assert G[nodes[2]][nodes[0]]["equity"] == e_2_0
+    assert G[nodes[2]][nodes[4]]["equity"] == 2
+    assert G[nodes[4]][nodes[2]]["equity"] == e_4_2
+
+
+    ################## packet ordering [Paths: 8 - 6 - 16, 9 - 11]
+    node_comm.set_latency(nodes[8], nodes[6], 10)
+    nodes[8].init_payment(G, nodes[16], 5, node_comm, test_mode=True, debug=TEST_DEBUG)
+    nodes[9].init_payment(G, nodes[11], 5, node_comm, test_mode=True, debug=TEST_DEBUG)
+    process_next_test_packet(G, node_comm, node_check=nodes[11], debug=TEST_DEBUG)
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG)
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG)
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG)
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG)
+
+
+
+    ####################################
+    # JIT ROUTING
+    ####################################
+
+    ################## JIT Routing - payment succeeds that would otherwise fail [Path: 0 - 1 - 2]
+    nodes[0].init_payment(G, nodes[2], 15, node_comm, test_mode=True, debug=TEST_DEBUG)
+    G[nodes[1]][nodes[2]]["equity"] = 10  # Will fail, needs to send 15
 
     e_0_1 = G[nodes[0]][nodes[1]]["equity"]
     e_1_0 = G[nodes[1]][nodes[0]]["equity"]
-    e_1_14 = G[nodes[1]][nodes[14]]["equity"]
-    e_14_1 = G[nodes[14]][nodes[1]]["equity"]
-    e_0_19 = G[nodes[0]][nodes[19]]["equity"]
-    e_19_0 = G[nodes[19]][nodes[0]]["equity"]
-    e_19_14 = G[nodes[19]][nodes[14]]["equity"]
-    e_14_19 = G[nodes[14]][nodes[19]]["equity"]
+    e_1_2 = G[nodes[1]][nodes[2]]["equity"]
+    e_2_1 = G[nodes[2]][nodes[1]]["equity"]
 
-    nodes[0].init_payment(G, nodes[14], 10, node_comm, k=3, test_mode=True, debug=TEST_DEBUG)
-    nodes[19].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
-    nodes[14].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
-    nodes[19].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
-    nodes[14].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
-    nodes[19].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
-    nodes[0].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
-    nodes[1].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
-    nodes[14].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
-    nodes[19].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
-    nodes[0].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
-    nodes[19].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
-    nodes[0].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
-    nodes[1].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
-    nodes[0].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
-
-    assert G[nodes[0]][nodes[19]]["equity"] == e_0_19 - amnts[0] * 2
-    assert G[nodes[19]][nodes[0]]["equity"] - (e_19_0 + amnts[0] * 2) <= 0.01  # Rounding issue
-    assert G[nodes[19]][nodes[14]]["equity"] == e_19_14 - amnts[1] * 2
-    assert G[nodes[14]][nodes[19]]["equity"] == e_14_19 + amnts[1] * 2
-    assert G[nodes[0]][nodes[1]]["equity"] == e_0_1 - amnts_2[0]
-    assert G[nodes[1]][nodes[0]]["equity"] == e_1_0 + amnts_2[0]
-    assert G[nodes[1]][nodes[14]]["equity"] == e_1_14 - amnts_2[1]
-    assert G[nodes[14]][nodes[1]]["equity"] == e_14_1 + amnts_2[1]
-
-    if TEST_DEBUG: print("\n// AMP SUCCESS - FAILS: REVERTED PARTIAL PAYMENTS\n-------------------------")
-
-    e_0_1 = G[nodes[0]][nodes[1]]["equity"]
-    e_1_0 = G[nodes[1]][nodes[0]]["equity"]
-    e_1_14 = G[nodes[1]][nodes[14]]["equity"]
-    e_14_1 = G[nodes[14]][nodes[1]]["equity"]
-    e_0_19 = G[nodes[0]][nodes[19]]["equity"]
-    e_19_0 = G[nodes[19]][nodes[0]]["equity"]
-    e_19_14 = G[nodes[19]][nodes[14]]["equity"]
-    e_14_19 = G[nodes[14]][nodes[19]]["equity"]
-
-    # Try same payment again - will work for subpayments but middle payment will fail.
-    # First and last subpayments reverted - so should be same as above.
-    # Stops when all routes exhausted - will also stop if taking too long - no need to test this.
-    nodes[0].init_payment(G, nodes[14], 10, node_comm, k=3, test_mode=True, debug=TEST_DEBUG)
-    nodes[19].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
-    nodes[14].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
-    nodes[19].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
-    nodes[0].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
-    nodes[1].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
-    nodes[14].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
-
-    # 0-19-14 will right now have 2 partial payments locked up in HTLC
-    assert G[nodes[0]][nodes[19]]["equity"] == e_0_19 - amnts[0]
-    assert G[nodes[19]][nodes[0]]["equity"] == e_19_0  # Same as no preimage received
-    assert G[nodes[19]][nodes[14]]["equity"] == e_19_14 - amnts[1]
-    assert G[nodes[14]][nodes[19]]["equity"] == e_14_19
-    assert G[nodes[0]][nodes[1]]["equity"] == e_0_1 - amnts_2[0]
-    assert G[nodes[1]][nodes[0]]["equity"] == e_1_0  # Same as no preimage received
-    assert G[nodes[1]][nodes[14]]["equity"] == e_1_14 - amnts_2[1]
-    assert G[nodes[14]][nodes[1]]["equity"] == e_14_1
-
-    # Release 2 subpayments that made the distance.
-    nodes[14].clear_old_amps(G, node_comm, True, TEST_DEBUG)
-
-    # Pretend all routes exhausting here rather than physically trying them.
-    # Because all routes aren't actually exhausted, when a subpayment comes back - keeps resending.
-
-    if TEST_DEBUG: print("\n// AMP SUCCESS - SUCCESS WITH FAILED ROUTES\n-------------------------")
-
-    # Try a payment that has failed routes, but finds enough other routes to
-    # successfully route the payment - reset so we can use same route.
-    G, pairs = generate_wattz_strogatz(NUM_TEST_NODES, 6, 0.3, 10, True)
-    nodes = list(G)
-
-    # Need to re-init for new node/edge references
-    node_comm = NodeCommunicator(nodes, pairs, test_mode=True, debug=TEST_DEBUG)
-
-    # Sent as 5/5/5 - alternative route 0-1-14 for last two payments.
-    path = [nodes[0], nodes[1], nodes[14]]
-    amnts = calc_path_fees(G, path, 5)
-
-    path = [nodes[0], nodes[19], nodes[14]]
-    amnts_2 = calc_path_fees(G, path, 5)
-
-    e_0_1 = G[nodes[0]][nodes[1]]["equity"]
-    e_1_0 = G[nodes[1]][nodes[0]]["equity"]
-    e_1_14 = G[nodes[1]][nodes[14]]["equity"]
-    e_14_1 = G[nodes[14]][nodes[1]]["equity"]
-    e_0_19 = G[nodes[0]][nodes[19]]["equity"]
-    e_19_0 = G[nodes[19]][nodes[0]]["equity"]
-    e_19_14 = G[nodes[19]][nodes[14]]["equity"]
-    e_14_19 = G[nodes[14]][nodes[19]]["equity"]
-
-    nodes[0].init_payment(G, nodes[14], 15, node_comm, k=3, test_mode=True, debug=TEST_DEBUG)
-    nodes[19].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
-    nodes[14].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
-    nodes[19].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
-    nodes[0].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
-    nodes[19].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
-    nodes[0].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
-
-    # New route 0-1-14
-    nodes[1].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
-    nodes[14].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
-    nodes[1].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
-    nodes[14].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
-
-    # Knows base preimage, so HTLCs released back
-    nodes[19].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
-    nodes[0].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
-    nodes[1].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
-    nodes[0].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
-    nodes[1].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
-    nodes[0].process_next_packet(G, node_comm, test_mode=True, debug=TEST_DEBUG)
-
-    # 2 on 0-1-14, 1 on 0-19-14
-    assert G[nodes[0]][nodes[1]]["equity"] == e_0_1 - amnts[0] * 2
-    assert G[nodes[1]][nodes[0]]["equity"] == e_1_0 + amnts[0] * 2
-    assert G[nodes[1]][nodes[14]]["equity"] == e_1_14 - amnts[1] * 2
-    assert G[nodes[14]][nodes[1]]["equity"] == e_14_1 + amnts[1] * 2
-    assert G[nodes[0]][nodes[19]]["equity"] == e_0_19 - amnts_2[0]
-    assert G[nodes[19]][nodes[0]]["equity"] == e_19_0 + amnts_2[0]
-    assert G[nodes[19]][nodes[14]]["equity"] == e_19_14 - amnts_2[1]
-    assert G[nodes[14]][nodes[19]]["equity"] == e_14_19 + amnts_2[1]
-
-    if TEST_DEBUG: print("\n// PACKET ARRIVAL TIME PROCESSING - FUTURE PACKETS\n-------------------------")
-
-    G, pairs = generate_wattz_strogatz(NUM_TEST_NODES, 6, 0.3, 10, True)
-    nodes = list(G)
-
-    # Need to re-init for new node/edge references
-    node_comm = NodeCommunicator(nodes, pairs, test_mode=True, debug=TEST_DEBUG)
-
-    e_0_1 = G[nodes[0]][nodes[1]]["equity"]
-    e_1_0 = G[nodes[1]][nodes[0]]["equity"]
-
-    node_comm.set_latency(nodes[0], nodes[1], 10)
-    nodes[0]._init_payment(G, nodes[1], 5, node_comm, test_mode=True, debug=TEST_DEBUG)
-    nodes[1].process_next_packet(G, node_comm, debug=TEST_DEBUG)
-
-    # Should be no change as packet hasn't "reached" 1 yet.
-    assert G[nodes[0]][nodes[1]]["equity"] == e_0_1
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG, jit_enabled=True)
+    assert G[nodes[0]][nodes[1]]["equity"] == e_0_1 - 15.175
     assert G[nodes[1]][nodes[0]]["equity"] == e_1_0
 
-    # Try again with no latency, new payment, old still won't have made it
-    node_comm.set_latency(nodes[0], nodes[1], 0)
-    nodes[0]._init_payment(G, nodes[1], 5, node_comm, test_mode=True, debug=TEST_DEBUG)
-    nodes[1].process_next_packet(G, node_comm, debug=TEST_DEBUG)
+    # Re-balance [Path: 1 - 3 - 2 - 1]
+    e_1_3 = G[nodes[1]][nodes[3]]["equity"]
+    e_3_1 = G[nodes[3]][nodes[1]]["equity"]
+    e_3_2 = G[nodes[3]][nodes[2]]["equity"]
+    e_2_3 = G[nodes[2]][nodes[3]]["equity"]
 
-    # Should be no change as packet hasn't "reached" 1 yet.
-    assert G[nodes[0]][nodes[1]]["equity"] == e_0_1 - 5
-    assert G[nodes[1]][nodes[0]]["equity"] == e_1_0 + 5
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG, jit_enabled=True)
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG, jit_enabled=True)
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG, jit_enabled=True)
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG, jit_enabled=True)
+
+    assert G[nodes[1]][nodes[2]]["equity"] == e_1_2 + 5  # More available now
+
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG, jit_enabled=True)
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG, jit_enabled=True)
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG, jit_enabled=True)
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG, jit_enabled=True)
+
+    assert G[nodes[1]][nodes[3]]["equity"] == e_1_3 - 5.2506
+    assert G[nodes[3]][nodes[1]]["equity"] == e_3_1 + 5.2506
+    assert G[nodes[3]][nodes[2]]["equity"] == e_3_2 - 5.125
+    assert G[nodes[2]][nodes[3]]["equity"] == e_2_3 + 5.125
+
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG, jit_enabled=True)
+
+    assert G[nodes[0]][nodes[1]]["equity"] == e_0_1 - 15.175
+    assert G[nodes[1]][nodes[0]]["equity"] == e_1_0 + 15.175
+    assert G[nodes[1]][nodes[2]]["equity"] == e_1_2 - 10
+    assert G[nodes[2]][nodes[1]]["equity"] == e_2_1 + 10
+
+
+    ################## JIT Routing - fails - no re-balance route found [Path: 0 - 3 - 18 - 19]
+    nodes[0].init_payment(G, nodes[19], 15, node_comm, test_mode=True, debug=TEST_DEBUG)
+    G[nodes[3]][nodes[15]]["equity"] = 0
+    G[nodes[3]][nodes[1]]["equity"] = 0
+    G[nodes[3]][nodes[5]]["equity"] = 0
+
+    e_0_3 = G[nodes[0]][nodes[3]]["equity"]
+    e_3_0 = G[nodes[3]][nodes[0]]["equity"]
+    e_3_18 = G[nodes[3]][nodes[18]]["equity"]
+    e_18_3 = G[nodes[18]][nodes[3]]["equity"]
+
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG, jit_enabled=True)
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG, jit_enabled=True)
+
+    # All reverted
+    assert G[nodes[0]][nodes[3]]["equity"] == e_0_3
+    assert G[nodes[3]][nodes[0]]["equity"] == e_3_0
+    assert G[nodes[3]][nodes[18]]["equity"] == e_3_18
+    assert G[nodes[18]][nodes[3]]["equity"] == e_18_3
+
+
+    ################## JIT Routing - failed rebalance [Path: 0 - 3 - 18 - 19]
+    nodes[0].init_payment(G, nodes[19], 15, node_comm, test_mode=True, debug=TEST_DEBUG)
+    G[nodes[3]][nodes[15]]["equity"] = 20  # Revert so works
+    G[nodes[15]][nodes[18]]["equity"] = 0  # So re-balance fails
+
+    e_0_3 = G[nodes[0]][nodes[3]]["equity"]
+    e_3_0 = G[nodes[3]][nodes[0]]["equity"]
+    e_3_18 = G[nodes[3]][nodes[18]]["equity"]
+    e_18_3 = G[nodes[18]][nodes[3]]["equity"]
+    e_3_15 = G[nodes[3]][nodes[15]]["equity"]
+
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG, jit_enabled=True)
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG, jit_enabled=True)
+    assert G[nodes[3]][nodes[15]]["equity"] - (e_3_15 - 5.4273) <= 0.0001  # HTLC set up (rouding errors)
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG, jit_enabled=True)
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG, jit_enabled=True)
+
+    # All reverted
+    assert G[nodes[3]][nodes[15]]["equity"] == e_3_15
+    assert G[nodes[0]][nodes[3]]["equity"] == e_0_3
+    assert G[nodes[3]][nodes[0]]["equity"] == e_3_0
+    assert G[nodes[3]][nodes[18]]["equity"] == e_3_18
+    assert G[nodes[18]][nodes[3]]["equity"] == e_18_3
+
+
+    ################## JIT Routing - funds depleted futher - failed re-rebalance [Path: 0 - 3 - 18 - 19]
+    nodes[0].init_payment(G, nodes[19], 15, node_comm, test_mode=True, debug=TEST_DEBUG)
+    G[nodes[3]][nodes[15]]["equity"] = 20  # Revert so works
+    G[nodes[15]][nodes[18]]["equity"] = 20
+
+    e_0_3 = G[nodes[0]][nodes[3]]["equity"]
+    e_3_0 = G[nodes[3]][nodes[0]]["equity"]
+    e_3_18 = G[nodes[3]][nodes[18]]["equity"]
+    e_18_3 = G[nodes[18]][nodes[3]]["equity"]
+    e_3_15 = G[nodes[3]][nodes[15]]["equity"]
+    e_15_3 = G[nodes[15]][nodes[3]]["equity"]
+
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG, jit_enabled=True)
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG, jit_enabled=True)
+    assert G[nodes[3]][nodes[15]]["equity"] - (e_3_15 - 5.4273) <= 0.0001  # HTLC set up (rouding errors)
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG, jit_enabled=True)
+
+    G[nodes[3]][nodes[18]]["equity"] -= 5  # Deplete further
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG, jit_enabled=True)
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG, jit_enabled=True)
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG, jit_enabled=True)
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG, jit_enabled=True)
+
+    G[nodes[15]][nodes[18]]["equity"] = 5  # Reduce to second re-balance won't work
+
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG, jit_enabled=True)
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG, jit_enabled=True)
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG, jit_enabled=True)
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG, jit_enabled=True)
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG, jit_enabled=True)
+
+    # All reverted, but one re-balance worked
+    assert G[nodes[3]][nodes[15]]["equity"] - (e_3_15 - 5.4273) <= 0.0001
+    assert G[nodes[15]][nodes[3]]["equity"] - (e_15_3 + 5.4273) <= 0.0001
+    assert G[nodes[0]][nodes[3]]["equity"] == e_0_3
+    assert G[nodes[3]][nodes[0]]["equity"] == e_3_0
+    assert G[nodes[3]][nodes[18]]["equity"] == e_3_18 - 5 + 5.175  # minus 5 for manual depletion
+    assert G[nodes[18]][nodes[3]]["equity"] == e_18_3 - 5.175
+
+
+    ################## JIT Routing - funds depleted futher - successful re-rebalance [Path: 0 - 3 - 18 - 19]
+    nodes[0].init_payment(G, nodes[19], 15, node_comm, test_mode=True, debug=TEST_DEBUG)
+    G[nodes[3]][nodes[15]]["equity"] = 20  # Revert so works
+    G[nodes[15]][nodes[18]]["equity"] = 20
+
+    e_0_3 = G[nodes[0]][nodes[3]]["equity"]
+    e_3_0 = G[nodes[3]][nodes[0]]["equity"]
+    e_3_18 = G[nodes[3]][nodes[18]]["equity"]
+    e_18_3 = G[nodes[18]][nodes[3]]["equity"]
+    e_18_19 = G[nodes[18]][nodes[19]]["equity"]
+    e_19_18 = G[nodes[19]][nodes[18]]["equity"]
+
+    e_3_15 = G[nodes[3]][nodes[15]]["equity"]
+    e_15_3 = G[nodes[15]][nodes[3]]["equity"]
+    e_15_18 = G[nodes[15]][nodes[18]]["equity"]
+    e_18_15 = G[nodes[18]][nodes[15]]["equity"]
+
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG, jit_enabled=True)
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG, jit_enabled=True)
+    assert G[nodes[3]][nodes[15]]["equity"] == e_3_15 - 5.2506  # HTLC set up
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG, jit_enabled=True)
+
+    G[nodes[3]][nodes[18]]["equity"] -= 5  # Deplete further
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG, jit_enabled=True)
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG, jit_enabled=True)
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG, jit_enabled=True)
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG, jit_enabled=True)
+
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG, jit_enabled=True)
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG, jit_enabled=True)
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG, jit_enabled=True)
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG, jit_enabled=True)
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG, jit_enabled=True)
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG, jit_enabled=True)
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG, jit_enabled=True)
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG, jit_enabled=True)
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG, jit_enabled=True)
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG, jit_enabled=True)
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG, jit_enabled=True)
+
+    # All reverted, but one re-balance worked
+    assert G[nodes[0]][nodes[3]]["equity"] - (e_0_3 - 15.3508) <= 0.0001
+    assert G[nodes[3]][nodes[0]]["equity"] - (e_0_3 + 15.3508) <= 0.0001
+    assert G[nodes[3]][nodes[18]]["equity"] == e_3_18 - 5 - 15.175 + 5 + 5  # minus 5 for manual depletion
+    assert G[nodes[18]][nodes[3]]["equity"] == e_18_3 + 15.175 - 5 - 5
+    assert G[nodes[18]][nodes[19]]["equity"] == e_18_19 - 15
+    assert G[nodes[19]][nodes[18]]["equity"] == e_19_18 + 15
+
+    assert G[nodes[3]][nodes[15]]["equity"] == e_3_15 - 5.2506 - 5.2506
+    assert G[nodes[15]][nodes[3]]["equity"] == e_15_3 + 5.2506 + 5.2506
+    assert G[nodes[15]][nodes[18]]["equity"] == e_15_18 - 5.1250 - 5.1250
+    assert G[nodes[18]][nodes[15]]["equity"] == e_18_15 + 5.1250 + 5.1250
+
+
+
+    ####################################
+    # ATOMIC MULTI-PATH PAYMENTS
+    ####################################
+
+    ################## successful multi-part payment, first go [Paths 7 - 9 - 12, 7 - 10 - 14 - 12]
+    nodes[7].init_payment(G, nodes[12], 10, node_comm, k=2, test_mode=True, debug=TEST_DEBUG)
+
+    e_9_12 = G[nodes[9]][nodes[12]]["equity"]
+    e_12_9 = G[nodes[12]][nodes[9]]["equity"]
+    e_12_14 = G[nodes[12]][nodes[14]]["equity"]
+
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG)
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG)
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG)
+
+    # First received, final funds shouldn't be auto-claimed
+    assert G[nodes[9]][nodes[12]]["equity"] == e_9_12 - 5
+    assert G[nodes[12]][nodes[9]]["equity"] == e_12_9
+
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG)
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG)
+
+    # Both received, funds claimed
+    assert G[nodes[12]][nodes[9]]["equity"] == e_12_9 + 5
+    assert G[nodes[12]][nodes[14]]["equity"] == e_12_14 + 5
+
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG)
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG)
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG)
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG)
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG)
+
+
+    ################## failed multi-part payment, first go [Paths 7 - 9 - 12, 7 - 10 - 14 - 12]
+    nodes[7].init_payment(G, nodes[12], 10, node_comm, k=2, test_mode=True, debug=TEST_DEBUG)
+    G[nodes[10]][nodes[14]]["equity"] = 0  # Deplete so fails
+
+    e_9_12 = G[nodes[9]][nodes[12]]["equity"]
+    e_12_9 = G[nodes[12]][nodes[9]]["equity"]
+    e_12_14 = G[nodes[12]][nodes[14]]["equity"]
+
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG)
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG)
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG)
+    process_next_test_packet(G, node_comm, debug=TEST_DEBUG)
+
+    # Fail, funds never claimed
+    assert G[nodes[12]][nodes[9]]["equity"] == e_12_9
+    assert G[nodes[12]][nodes[14]]["equity"] == e_12_14
+
+
+    ################## successful multi-part payment with resending [Paths 7 - 9 - 12, 7 - 10 - 14 - 12 [-> 7 - 8 - 11 - 13 - 12]]
+    nodes[7].init_payment(G, nodes[12], 10, node_comm, k=2, test_mode=True, debug=TEST_DEBUG)
+
+    e_9_12 = G[nodes[9]][nodes[12]]["equity"]
+    e_12_9 = G[nodes[12]][nodes[9]]["equity"]
+    e_12_13 = G[nodes[12]][nodes[13]]["equity"]
+
+    process_next_test_packet(G, node_comm, amp_resend_enabled=True, debug=TEST_DEBUG)
+    process_next_test_packet(G, node_comm, amp_resend_enabled=True, debug=TEST_DEBUG)
+    process_next_test_packet(G, node_comm, amp_resend_enabled=True, debug=TEST_DEBUG)
+    process_next_test_packet(G, node_comm, amp_resend_enabled=True, debug=TEST_DEBUG)
+    process_next_test_packet(G, node_comm, amp_resend_enabled=True, debug=TEST_DEBUG)
+    process_next_test_packet(G, node_comm, amp_resend_enabled=True, debug=TEST_DEBUG)
+    process_next_test_packet(G, node_comm, amp_resend_enabled=True, debug=TEST_DEBUG)
+    process_next_test_packet(G, node_comm, amp_resend_enabled=True, debug=TEST_DEBUG)
+    process_next_test_packet(G, node_comm, amp_resend_enabled=True, debug=TEST_DEBUG)
+    process_next_test_packet(G, node_comm, amp_resend_enabled=True, debug=TEST_DEBUG)
+    process_next_test_packet(G, node_comm, amp_resend_enabled=True, debug=TEST_DEBUG)
+    process_next_test_packet(G, node_comm, amp_resend_enabled=True, debug=TEST_DEBUG)
+    process_next_test_packet(G, node_comm, amp_resend_enabled=True, debug=TEST_DEBUG)
+    process_next_test_packet(G, node_comm, amp_resend_enabled=True, debug=TEST_DEBUG)
+
+    # succeeds, funds never claimed
+    assert G[nodes[12]][nodes[9]]["equity"] == e_12_9 + 5
+    assert G[nodes[12]][nodes[13]]["equity"] == e_12_13 + 5
+
+
+    ################## failed multi-part payment with resending (no routes left) [Paths 7 - 10 - 14 - 12 [-> all fail], 7 - 8 - 11 - 13 - 12]
+    nodes[7].init_payment(G, nodes[12], 10, node_comm, k=2, test_mode=True, debug=TEST_DEBUG)
+
+    e_9_12 = G[nodes[9]][nodes[12]]["equity"]
+    e_12_9 = G[nodes[12]][nodes[9]]["equity"]
+    e_12_13 = G[nodes[12]][nodes[13]]["equity"]
+
+    # To ensure all paths fail
+    G[nodes[10]][nodes[9]]["equity"] = 0
+    G[nodes[10]][nodes[1]]["equity"] = 0
+    G[nodes[10]][nodes[8]]["equity"] = 0
+
+    for _ in range(22):
+        process_next_test_packet(G, node_comm, amp_resend_enabled=True, debug=TEST_DEBUG)
+
+    # succeeds, funds never claimed
+    assert G[nodes[12]][nodes[9]]["equity"] == e_12_9
+    assert G[nodes[12]][nodes[13]]["equity"] == e_12_13
+
+if __name__ == "__main__":
+    test_func()
+
 
 for i in range(20):
     for max_amnt in [2]:
         for timing in [0.02]:
             for k in [1]:
-                for rb in [0.1, 0.2, 0.3, 0.4, 0.5]:
-                    simulator(max_amnt, timing, rb=rb, k=k, ws=False)
-                    print("\n\n")
-
-# if __name__ == "__main__":
-    # test_func()
+                simulator(max_amnt, timing, k=k, ws=True)
+                print("\n\n")
